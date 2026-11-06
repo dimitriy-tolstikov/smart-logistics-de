@@ -1,0 +1,46 @@
+services:
+  db:
+    image: postgres:17
+    container_name: ul-de-db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-deals_bigdata}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./sql:/sql:ro
+      - ./sql/dwh:/sql/dwh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-deals_bigdata}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ul-de-app
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/deals_bigdata
+      PGHOST: db
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: deals_bigdata
+      N_PRICES: ${N_PRICES:-300000}
+      AS_OF_DATE: ${AS_OF_DATE:-2026-10-26}
+      ETL_START_DATE: ${ETL_START_DATE:-2019-01-01}
+      ETL_END_DATE: ${ETL_END_DATE:-2027-12-31}
+      ML_RANDOM_SEED: ${ML_RANDOM_SEED:-42}
+    volumes:
+      - ./:/app
+    command: ["/app/docker/entrypoint.sh"]
+
+volumes:
+  pgdata:
