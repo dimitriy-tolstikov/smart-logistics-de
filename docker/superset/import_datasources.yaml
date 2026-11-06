@@ -1,0 +1,14 @@
+# Reference datasource definitions (seeded programmatically by create_dashboard.py).
+databases:
+  - database_name: PostgreSQL DWH
+    sqlalchemy_uri: postgresql+psycopg2://postgres:postgres@db:5432/deals_bigdata
+    tables:
+      - table_name: route_card
+        schema: mart
+      - table_name: ml_price_predictions
+        schema: mart
+  - database_name: ClickHouse Mart
+    sqlalchemy_uri: clickhousedb://default:clickhouse@clickhouse:8123/default
+    tables:
+      - table_name: route_card
+        schema: mart

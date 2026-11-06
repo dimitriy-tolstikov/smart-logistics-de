@@ -4,3 +4,4 @@ catboost==1.2.7
 scikit-learn==1.5.2
 pytest==8.3.3
 python-dotenv==1.0.1
+clickhouse-connect==0.8.17
