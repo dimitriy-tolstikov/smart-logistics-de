@@ -93,6 +93,7 @@ CREATE INDEX prices_meta_item_id_index ON prices (meta_item_id);
 CREATE INDEX main_prices_index ON prices (loading_city_gcid, unloading_city_gcid, total_weight, total_volume);
 CREATE INDEX main_prices_cat_index ON prices (loading_city_gcid, unloading_city_gcid, weight_category, volume_category, outlier_mark);
 CREATE INDEX price_group_index ON prices (price_group_id);
+CREATE INDEX prices_loading_date_idx ON prices (loading_date);
 
 -- 2023_10_13_051908_create_price_body_types_table
 CREATE TABLE price_body_types (

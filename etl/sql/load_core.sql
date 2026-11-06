@@ -1,0 +1,2 @@
+-- Split into load_core_*.sql (one statement per file) for psycopg prepared statements.
+-- Executed in order by etl/run_etl.py.
