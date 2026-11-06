@@ -71,7 +71,7 @@ SELECT
     CASE
         WHEN n.price_original <= 0 THEN 'price_non_positive'
         -- RUB trip prices <= 1000 are source-validation anomalies (too low for a full trip)
-        WHEN n.currency_code = '643' AND n.price_original > 1000 THEN 'rub_price_extreme'
+        WHEN n.currency_code = '643' AND n.price_original <= 1000 THEN 'rub_price_extreme'
         WHEN n.distance <= 0 THEN 'distance_non_positive'
         WHEN n.total_weight < 0 THEN 'weight_negative'
         WHEN n.total_volume < 0 THEN 'volume_negative'
