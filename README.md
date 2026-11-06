@@ -7,6 +7,166 @@
 
 Цель этого тестового задания — посмотреть, как ты проектируешь хранилища и аналитические витрины данных, выстраиваешь надежные идемпотентные ETL-пайплайны на приближенных к бою данных и подготавливаешь признаки для ML-моделей без утечек данных (*Data Leakage*).
 
+---
+
+## Реализация (это решение)
+
+### Выбор стека
+
+- **PostgreSQL 17** — единое хранилище для источника, Core, DQ и Mart: один `docker compose up`, транзакции и SQL-агрегации без отдельного OLAP на обязательном этапе.
+- **SQL ELT + тонкий Python-оркестратор** (`python -m etl.run_etl`) — базовый путь; тот же пайплайн обёрнут в Airflow DAG при профиле `bonus` (задача со ★).
+- **CatBoost** — табличные признаки со смешанными категориями и численными полями, стабильный seed и однопоточность для воспроизводимости; границы `train/test` считаются от `AS_OF_DATE`.
+- **★ ClickHouse** — копия витрин `mart.route_card` / `mart.ml_price_predictions` на `ReplacingMergeTree` (синхронизация из Postgres, идемпотентный full refresh).
+- **★ Apache Superset** — подключение Postgres/ClickHouse витрин и демо-дашборд «Smart Logistics — Market Corridor».
+
+### Архитектура
+
+- **Слои в PostgreSQL 17:** `public` (операционный источник из `sql/schema.sql` + `sql/synthetic.sql`), `core.fact_prices` (очищенные сделки с `price_rub`), `mart.route_card` (коридор ставок), `mart.ml_price_predictions` (batch-скоринг), `dq.quarantine_prices` (карантин), `etl_meta.runs` (аудит прогонов).
+- **ETL:** SQL-трансформации в `etl/sql/` + оркестратор `python -m etl.run_etl`. Повторный прогон удаляет строки как по сохранённой, так и по текущей дате источника, поэтому исправление `loading_date` не оставляет устаревших строк в `core` и `dq`.
+- **FX:** конвертация USD/EUR в RUB по курсу на дату `nearest_rate_date` (`exchange_rates`), совпадение `setting_date = nearest_rate_date`; строки без курса уходят в карантин.
+- **Витрина:** одна сделка попадает в каждую связанную бизнес-группу кузова без дублей внутри группы; fallback на `prices.body_type` действует только при отсутствии связей. Повторные `price_dates` внутри месяца не увеличивают вес сделки. Backfill пересчитывает полную историю только затронутых маршрутов, а не всю `route_card`; удаление и вставка выполняются в одной транзакции с Core/DQ. Для выборки окон и маршрутов используются индексы по `prices.loading_date`, `core.fact_prices.loading_date` и паре городов Core.
+- **ML:** `ml/train_predict.py` — признаки из `core`, дедуп справочника городов, детерминированная категория из всех групп кузова, циклические даты и **time split** от `AS_OF_DATE` (`train = [as_of−3м, as_of−3н)`, `test = [as_of−3н, as_of]`). CatBoost работает с фиксированным seed в один поток, входной набор отсортирован по `price_id`. Скорятся тестовый период и **все будущие заявки**, включая `price_type = 6`, сложные маршруты и строки с `outlier_mark = true`; для будущих заявок факт и ошибки равны `NULL`. Полная замена прогнозов выполняется в одной транзакции.
+- **★ Бонусный контур:** `dags/ul_etl_dag.py` (Airflow) → те же `etl.run_etl` / `ml.train_predict` → `etl.sync_clickhouse`; BI в Superset поверх Postgres и ClickHouse.
+
+Переменные окружения — см. [`.env.example`](.env.example). `DATABASE_URL` в Compose собирается из тех же `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB`, что и сервис `db`.
+
+### Запуск одной командой (Docker)
+
+```bash
+cp .env.example .env   # при необходимости поправьте пароль/порт
+docker compose up --build
+```
+
+Сервис `app` после старта Postgres выполнит: `python -m etl.bootstrap_db` (DDL источника, генерация данных при пустой `prices`, DDL `sql/dwh/*.sql`), `python -m etl.run_etl`, `python -m ml.train_predict`. Логи метрик ML — в stdout контейнера `ul-de-app`.
+
+Повторный запуск контейнера пересчитает тот же интервал идемпотентно.
+
+### Backfill за произвольный период
+
+Повторный ETL для окна `[start, end)` (полуинтервал) и снимка `as_of`:
+
+```bash
+ETL_START_DATE=2026-10-01 ETL_END_DATE=2026-11-01 \
+AS_OF_DATE=2026-10-26 python -m etl.run_etl
+```
+
+После backfill, который меняет состав `core.fact_prices` в train/test/future окнах, перезапустите batch-скоринг:
+
+```bash
+AS_OF_DATE=2026-10-26 python -m ml.train_predict
+```
+
+Если менялись только исторические ячейки `mart.route_card` вне ML-окон, повторный ML не обязателен.
+
+### Бонус ★: Airflow / Superset / ClickHouse
+
+Обязательный `docker compose up` поднимает только Postgres + `app` (как требует ТЗ: СУБД, init, пайплайны, скоринг). Бонусный стек — отдельный Compose-профиль, чтобы не утяжелять базовый прогон:
+
+```bash
+# 1) Базовый пайплайн (или уже выполнен ранее)
+docker compose up --build
+
+# 2) ClickHouse + Airflow + Superset
+# На Linux: export AIRFLOW_UID=$(id -u)
+docker compose --profile bonus up --build
+```
+
+После того как ClickHouse healthy, один раз синхронизируйте витрины (или включите `CLICKHOUSE_SYNC_ENABLED=1` и перезапустите `app`):
+
+```bash
+docker compose exec app python -m etl.sync_clickhouse
+# либо Trigger DAG ul_etl_ml_clickhouse в Airflow UI
+```
+
+| Сервис | URL / порт | Логин |
+| :--- | :--- | :--- |
+| Airflow | http://localhost:8080 | `admin` / `admin` |
+| Superset | http://localhost:8088 | `admin` / `admin` |
+| ClickHouse HTTP | http://localhost:8123 | user `default`, password `clickhouse` |
+
+**Airflow.** DAG `ul_etl_ml_clickhouse`: `run_etl` → `train_predict` → `sync_clickhouse`. По умолчанию DAG на паузе; снимите паузу или Trigger DAG with config:
+
+```json
+{"start_date": "2026-10-01", "end_date": "2026-11-01", "as_of": "2026-10-26"}
+```
+
+**ClickHouse.** DDL: [`sql/clickhouse/01_mart_route_card.sql`](sql/clickhouse/01_mart_route_card.sql) (`ReplacingMergeTree`). Синхронизация:
+
+```bash
+# из контейнера app / airflow (когда ClickHouse доступен)
+python -m etl.sync_clickhouse
+```
+
+Проверка числа строк:
+
+```sql
+SELECT count() FROM mart.route_card FINAL;
+SELECT count() FROM mart.ml_price_predictions FINAL;
+```
+
+**Superset.** Bootstrap создаёт источники PostgreSQL DWH и ClickHouse Mart, датасеты `mart.route_card` / `mart.ml_price_predictions` и дашборд **Smart Logistics — Market Corridor** (`/superset/dashboard/smart-logistics-corridor/`) с таблицей коридора, pie по `reliability_level` и выборкой факт vs прогноз.
+
+### Локальный запуск без Docker
+
+Нужны **PostgreSQL 17**, **Python 3.11+**, **клиент `psql`** (для `\if` в `synthetic.sql`).
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+export DATABASE_URL=postgresql://postgres:postgres@localhost:5432/deals_bigdata
+python -m etl.bootstrap_db
+python -m etl.run_etl
+python -m ml.train_predict
+pytest -q
+```
+
+### Примеры проверки витрин (SQL)
+
+Коридор по маршруту и месяцу (подставьте свои `gc_id` и `month`):
+
+```sql
+SELECT month, loading_city_gcid, unloading_city_gcid, body_group_std_id, weight_category,
+       median_trip, p25_trip, p75_trip, median_km, trips_count, carriers_count, reliability_level, mom_pct, yoy_pct
+FROM mart.route_card
+WHERE loading_city_gcid = 1001 AND unloading_city_gcid = 1003
+ORDER BY month DESC
+LIMIT 12;
+```
+
+Прогноз vs факт на тестовом окне и плановые заявки после `as_of`:
+
+```sql
+SELECT
+  COUNT(*) FILTER (WHERE actual_price_rub IS NOT NULL) AS scored_with_actual,
+  COUNT(*) FILTER (WHERE actual_price_rub IS NULL) AS future_only,
+  AVG(ape_pct) FILTER (WHERE actual_price_rub IS NOT NULL) AS avg_ape_pct
+FROM mart.ml_price_predictions;
+```
+
+### Проверенные результаты
+
+Полный синтетический набор (300 000 исходных сделок, `as_of = 2026-10-26`):
+
+| Метрика | Значение |
+| :--- | ---: |
+| R² | 0.9195 |
+| MAPE | 15.69% |
+| RMSE | 54 290.57 руб. |
+| MAE | 28 332.70 руб. |
+| Train / test | 24 226 / 12 808 строк |
+| Batch scoring | 18 806 строк, из них 5 998 будущих |
+
+Два последовательных прогона дали одинаковые метрики и идентичный MD5-хеш содержимого прогнозов (без `scored_at`): `929385b4a6f0cf73d6573a9c0570296b`.
+
+### Ограничения и допущения
+
+- Метрики ML выводятся в **лог** при обучении; при пустом тестовом сплите (мало данных в окне) в логу будет предупреждение.
+- **Важно:** сделки за `2026-10-26` ещё не прошли ночной джоб разметки аномалий и имеют `outlier_mark = false` по умолчанию. Поэтому среди них могут остаться неразмеченные выбросы; базовый ETL использует исходный флаг и не пересчитывает его.
+- Будущие сложные маршруты и строки с `outlier_mark = true` скорятся для полноты покрытия, но не участвуют в обучении и исторической рыночной витрине.
+- Оценка **надёжности** (`HIGH`) использует календарную свежесть последней погрузки в ячейке относительно `as_of` (см. `refresh_route_card.sql`).
+
+---
+
 ### Формат и условия выполнения
 * **Формат:** Самостоятельная оффлайн-разработка сквозного прототипа (*Take-Home Project*) из **3 связанных этапов**.
 * **Таймбокс:** Ориентировочно **2–3 дня** (мы оцениваем архитектурную зрелость и чистоту инженерных решений, а не количество бойлерплейта).
@@ -234,7 +394,7 @@ psql -U postgres -d deals_bigdata -v ON_ERROR_STOP=1 -v n_prices=300000 -f sql/s
    * [ ] `README.md` — архитектура решения, обоснование выбранного стека (СУБД, оркестратор, ML-модель), пошаговая инструкция запуска, примеры SQL-запросов для проверки витрин и сводка полученных метрик ML ($R^2$, MAPE, RMSE, MAE);
    * [ ] `docker-compose.yml`, `Dockerfile`(ы) и `.env.example` — инфраструктура и переменные окружения;
    * [ ] `etl/` — обязательный код пайплайна валидации, очистки, конвертации валют и идемпотентной загрузки данных с инструкцией повторного запуска за выбранный период (Вопрос 1);
-   * [ ] `dags/` — необязательный артефакт для бонусной реализации на Apache Airflow;
+   * [x] `dags/` — бонус ★: DAG `ul_etl_ml_clickhouse` (профиль Compose `bonus`);
    * [ ] `sql/` (или `migrations/`) — DDL аналитического слоя (Core / Mart) и эталонный SQL-запрос расчета карточки маршрута и рыночного коридора (Вопрос 2);
    * [ ] `ml/` — код Feature Pipeline, хронологического обучения модели и пакетного скоринга (Batch Inference) с сохранением прогнозов в БД (Вопрос 3).
 
