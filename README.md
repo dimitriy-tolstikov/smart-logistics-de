@@ -14,7 +14,7 @@
 ### Выбор стека
 
 - **PostgreSQL 17** — единое хранилище для источника, Core, DQ и Mart: один `docker compose up`, транзакции и SQL-агрегации без отдельного OLAP на обязательном этапе.
-- **SQL ELT + тонкий Python-оркестратор** (`python -m etl.run_etl`) — базовый путь; тот же пайплайн обёрнут в Airflow DAG при профиле `bonus` (задача со ★).
+- **SQL ELT + тонкий Python-оркестратор** (`python -m etl.run_etl`) — базовый путь. Отдельный планировщик на обязательном контуре не нужен: один идемпотентный батч поднимает `docker compose up`. Тот же пайплайн обёрнут в Airflow DAG только в профиле `bonus` (задача со ★).
 - **CatBoost** — табличные признаки со смешанными категориями и численными полями, стабильный seed и однопоточность для воспроизводимости; границы `train/test` считаются от `AS_OF_DATE`.
 - **★ ClickHouse** — копия витрин `mart.route_card` / `mart.ml_price_predictions` на `ReplacingMergeTree` (синхронизация из Postgres, идемпотентный full refresh).
 - **★ Apache Superset** — подключение Postgres/ClickHouse витрин и демо-дашборд «Smart Logistics — Market Corridor».
@@ -119,6 +119,8 @@ python -m etl.run_etl
 python -m ml.train_predict
 pytest -q
 ```
+
+Интеграционные тесты помечены `integration`. Они создают временную БД `ul_pytest_<pid>` на локальном Postgres (или на сервере из `TEST_DATABASE_URL`) и удаляют её в конце сессии, не записывая в рабочую `deals_bigdata`. Если Postgres недоступен, эти тесты пропускаются. В CI (`CI=1` или `PYTEST_REQUIRE_DB=1`) пропуск считается ошибкой.
 
 ### Примеры проверки витрин (SQL)
 
