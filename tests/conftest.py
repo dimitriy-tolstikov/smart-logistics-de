@@ -7,11 +7,17 @@ from typing import Generator
 import psycopg
 import pytest
 
-from tests.db_helpers import connect_integration
+from tests.db_helpers import connect_integration, drop_test_database, integration_skips, require_db
 
 
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "integration: tests that require a live PostgreSQL database")
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    drop_test_database()
+    if require_db() and integration_skips() and exitstatus == 0:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
 @pytest.fixture
