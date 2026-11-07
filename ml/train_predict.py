@@ -81,6 +81,54 @@ def _safe_float(x: object) -> float:
     return float(x)
 
 
+def cyclic_date_features(ld: date) -> dict[str, float]:
+    """Calendar parts and sin/cos encodings used as model features."""
+    year = ld.year
+    month = ld.month
+    dow = ld.weekday()
+    doy = ld.timetuple().tm_yday
+    return {
+        "year": float(year),
+        "month": float(month),
+        "dow": float(dow),
+        "doy": float(doy),
+        "sin_doy": math.sin(2 * math.pi * doy / 365.25),
+        "cos_doy": math.cos(2 * math.pi * doy / 365.25),
+        "sin_month": math.sin(2 * math.pi * (month - 1) / 12.0),
+        "cos_month": math.cos(2 * math.pi * (month - 1) / 12.0),
+        "sin_dow": math.sin(2 * math.pi * dow / 7.0),
+        "cos_dow": math.cos(2 * math.pi * dow / 7.0),
+    }
+
+
+def score_actuals(
+    loading_date: date,
+    price_rub: float,
+    yhat: float,
+    as_of: date,
+) -> tuple[float | None, float | None, float | None]:
+    """Future deals keep actual, absolute error and APE empty."""
+    if loading_date > as_of:
+        return None, None, None
+    actual = float(price_rub)
+    abs_err = abs(actual - float(yhat))
+    ape = None if actual == 0 else abs((actual - float(yhat)) / actual) * 100.0
+    return actual, abs_err, ape
+
+
+def build_model(*, iterations: int = 400) -> CatBoostRegressor:
+    return CatBoostRegressor(
+        loss_function="RMSE",
+        depth=8,
+        learning_rate=0.08,
+        iterations=iterations,
+        random_seed=ML_RANDOM_SEED,
+        thread_count=1,
+        allow_writing_files=False,
+        verbose=False,
+    )
+
+
 CAT_COLS: Sequence[str] = (
     "weight_category",
     "volume_category",
@@ -132,32 +180,11 @@ def load_training_table(conn: psycopg.Connection) -> TrainingTable:
         FROM public.cities
         ORDER BY gc_id, id ASC
     ),
-    linked_body AS (
-        SELECT DISTINCT
-            pbt.price_id,
-            core.map_body_group_std_id(bt.std_id) AS body_group_std_id
-        FROM public.price_body_types pbt
-        JOIN public.body_types bt ON bt.id = pbt.body_type_id
-    ),
-    fallback_body AS (
-        SELECT
-            f.price_id,
-            core.map_body_group_std_id(bt.std_id) AS body_group_std_id
-        FROM core.fact_prices f
-        LEFT JOIN public.body_types bt ON bt.id = f.body_type_source
-        WHERE NOT EXISTS (
-            SELECT 1 FROM public.price_body_types pbt WHERE pbt.price_id = f.price_id
-        )
-    ),
     body_std AS (
         SELECT
             price_id,
             string_agg(body_group_std_id::text, '|' ORDER BY body_group_std_id) AS body_group_key
-        FROM (
-            SELECT price_id, body_group_std_id FROM linked_body
-            UNION ALL
-            SELECT price_id, body_group_std_id FROM fallback_body
-        ) bodies
+        FROM core.price_body_group
         GROUP BY price_id
     )
     SELECT
@@ -217,10 +244,6 @@ def load_training_table(conn: psycopg.Connection) -> TrainingTable:
     n_features = len(CAT_COLS) + len(NUM_COLS)
     X = np.empty((n, n_features), dtype=object)
 
-    T_year = 365.25
-    T_month = 12.0
-    T_week = 7.0
-
     for i, row in enumerate(rows):
         pid = int(row[col_idx["price_id"]])
         ld = row[col_idx["loading_date"]]
@@ -237,10 +260,7 @@ def load_training_table(conn: psycopg.Connection) -> TrainingTable:
             v = _safe_float(x)
             return 0.0 if math.isnan(v) else v
 
-        year = ld.year
-        month = ld.month
-        dow = ld.weekday()
-        doy = ld.timetuple().tm_yday
+        cal = cyclic_date_features(ld)
 
         dist = _safe_float(row[col_idx["distance"]])
         tw = _safe_float(row[col_idx["total_weight"]])
@@ -259,16 +279,16 @@ def load_training_table(conn: psycopg.Connection) -> TrainingTable:
                 llo,
                 ula,
                 ulo,
-                float(year),
-                float(month),
-                float(dow),
-                float(doy),
-                math.sin(2 * math.pi * doy / T_year),
-                math.cos(2 * math.pi * doy / T_year),
-                math.sin(2 * math.pi * (month - 1) / T_month),
-                math.cos(2 * math.pi * (month - 1) / T_month),
-                math.sin(2 * math.pi * dow / T_week),
-                math.cos(2 * math.pi * dow / T_week),
+                cal["year"],
+                cal["month"],
+                cal["dow"],
+                cal["doy"],
+                cal["sin_doy"],
+                cal["cos_doy"],
+                cal["sin_month"],
+                cal["cos_month"],
+                cal["sin_dow"],
+                cal["cos_dow"],
             ],
             dtype=np.float64,
         )
@@ -360,16 +380,7 @@ def main() -> None:
 
     train_pool = Pool(X_train, label=y_train, cat_features=cat_feat_idx)
 
-    model = CatBoostRegressor(
-        loss_function="RMSE",
-        depth=8,
-        learning_rate=0.08,
-        iterations=400,
-        random_seed=ML_RANDOM_SEED,
-        thread_count=1,
-        allow_writing_files=False,
-        verbose=False,
-    )
+    model = build_model()
     LOG.info("Training CatBoost: train=%s test=%s", X_train.shape[0], X_test.shape[0])
     # Do not pass test as eval_set — that would leak the holdout into training dynamics.
     model.fit(train_pool)
@@ -391,10 +402,7 @@ def main() -> None:
     out_rows: list[tuple] = []
     for row_i, yhat in zip(score_idx.tolist(), pred_all.tolist()):
         ld = tbl.loading_date[row_i]
-        is_future = ld > as_of
-        actual = None if is_future else float(tbl.price_rub[row_i])
-        abs_err = None if actual is None else abs(actual - float(yhat))
-        ape = None if actual is None or actual == 0 else abs((actual - float(yhat)) / actual) * 100.0
+        actual, abs_err, ape = score_actuals(ld, float(tbl.price_rub[row_i]), float(yhat), as_of)
         out_rows.append(
             (
                 int(tbl.price_id[row_i]),

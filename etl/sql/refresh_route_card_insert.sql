@@ -2,37 +2,17 @@
 WITH params AS (
     SELECT (%(as_of)s::date) AS as_of
 ),
-linked_body AS (
-    SELECT DISTINCT
-        pbt.price_id,
-        core.map_body_group_std_id(bt.std_id) AS body_group_std_id
-    FROM public.price_body_types pbt
-    JOIN public.body_types bt ON bt.id = pbt.body_type_id
-    JOIN core.fact_prices f ON f.price_id = pbt.price_id
-    JOIN pg_temp.route_refresh_routes rr
-      ON rr.loading_city_gcid = f.loading_city_gcid
-     AND rr.unloading_city_gcid = f.unloading_city_gcid
-),
-fallback_body AS (
-    SELECT
-        f.price_id,
-        core.map_body_group_std_id(bt.std_id) AS body_group_std_id
+touched_prices AS (
+    SELECT f.price_id
     FROM core.fact_prices f
     JOIN pg_temp.route_refresh_routes rr
       ON rr.loading_city_gcid = f.loading_city_gcid
      AND rr.unloading_city_gcid = f.unloading_city_gcid
-    LEFT JOIN public.body_types bt ON bt.id = f.body_type_source
-    WHERE NOT EXISTS (
-        SELECT 1 FROM public.price_body_types pbt WHERE pbt.price_id = f.price_id
-    )
 ),
 deal_body AS (
-    SELECT DISTINCT price_id, body_group_std_id
-    FROM (
-        SELECT price_id, body_group_std_id FROM linked_body
-        UNION ALL
-        SELECT price_id, body_group_std_id FROM fallback_body
-    ) bodies
+    SELECT tp.price_id, g.body_group_std_id
+    FROM touched_prices tp
+    CROSS JOIN LATERAL core.price_body_groups(tp.price_id) g
 ),
 base AS (
     SELECT DISTINCT
@@ -155,14 +135,8 @@ SELECT
     e.trips_count,
     e.carriers_count,
     e.cv_rate,
-    CASE
-        WHEN e.prev_median IS NULL OR e.prev_median = 0 THEN NULL
-        ELSE (e.median_trip - e.prev_median) / e.prev_median * 100.0
-    END AS mom_pct,
-    CASE
-        WHEN e.yoy_median IS NULL OR e.yoy_median = 0 THEN NULL
-        ELSE (e.median_trip - e.yoy_median) / e.yoy_median * 100.0
-    END AS yoy_pct,
+    mart.change_pct(e.median_trip, e.prev_median) AS mom_pct,
+    mart.change_pct(e.median_trip, e.yoy_median) AS yoy_pct,
     CASE
         WHEN e.trips_count >= 30
              AND COALESCE(e.carriers_count, 0) >= 5
