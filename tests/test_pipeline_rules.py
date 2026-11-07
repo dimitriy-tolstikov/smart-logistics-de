@@ -393,3 +393,136 @@ def test_backfill_handles_route_city_change(conn: psycopg.Connection) -> None:
             assert cur.fetchone()[0] == 1
     finally:
         _cleanup(conn, price_ids, [old_load, unload_gc, new_load])
+
+
+@pytest.mark.integration
+def test_weight_volume_boundaries_and_negative_distance(conn: psycopg.Connection) -> None:
+    load_gc, unload_gc = 9_993_051, 9_993_052
+    price_ids: list[int] = []
+    day = date(2099, 4, 10)
+    try:
+        with conn.cursor() as cur:
+            _insert_cities(cur, load_gc, unload_gc)
+            specs = [
+                ("w30", 30.0, 120.0, 50000.0, 100.0),
+                ("w10", 10.0, 0.1, 50000.0, 100.0),
+                ("w5", 5.0, 50.0, 50000.0, 100.0),
+                ("w2_5", 2.5, 50.0, 50000.0, 100.0),
+                ("w0_5", 0.5, 0.0, 50000.0, 100.0),
+                ("w0_44", 0.44, 120.01, 50000.0, 100.0),
+                ("w9_94", 9.94, 50.0, 50000.0, 100.0),
+            ]
+            created: dict[str, int] = {}
+            for name, weight, volume, price, distance in specs:
+                created[name] = _insert_price(
+                    cur,
+                    day,
+                    load_gc,
+                    unload_gc,
+                    price=price,
+                    total_weight=weight,
+                    total_volume=volume,
+                    distance=distance,
+                )
+            created["neg_distance"] = _insert_price(
+                cur, day, load_gc, unload_gc, distance=-5.0
+            )
+            price_ids = list(created.values())
+        conn.commit()
+        counts = run_etl_transaction(conn, date(2099, 4, 1), date(2099, 5, 1), date(2099, 12, 31))
+        conn.commit()
+        assert counts["load_core_insert_fact"] >= 7
+        assert counts["load_core_insert_quarantine"] >= 1
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT price_id, weight_category, volume_category
+                FROM core.fact_prices
+                WHERE price_id = ANY(%s)
+                """,
+                (price_ids,),
+            )
+            cats = {int(pid): (wc, vc) for pid, wc, vc in cur.fetchall()}
+            cur.execute(
+                "SELECT reason_code FROM dq.quarantine_prices WHERE price_id = %s",
+                (created["neg_distance"],),
+            )
+            reason = cur.fetchone()
+            cur.execute(
+                "SELECT mart.change_pct(15, NULL), mart.change_pct(15, 0), mart.change_pct(15, 12)"
+            )
+            mom = cur.fetchone()
+
+        assert cats[created["w30"]] == ("G20T", "FTL")
+        assert cats[created["w10"]] == ("FTL", "FTL")
+        assert cats[created["w5"]] == ("10T", "FTL")
+        assert cats[created["w2_5"]] == ("5T", "FTL")
+        assert cats[created["w0_5"]] == ("L5T", "OTH")
+        assert cats[created["w0_44"]] == ("OTH", "OTH")
+        assert cats[created["w9_94"]] == ("10T", "FTL")
+        assert created["neg_distance"] not in cats
+        assert reason[0] == "distance_non_positive"
+        assert mom[0] is None and mom[1] is None
+        assert float(mom[2]) == pytest.approx(25.0)
+    finally:
+        _cleanup(conn, price_ids, [load_gc, unload_gc])
+
+
+@pytest.mark.integration
+def test_carriers_type_9_and_medium_reliability(conn: psycopg.Connection) -> None:
+    load_gc, unload_gc = 9_993_061, 9_993_062
+    as_of = date(2099, 10, 20)
+    price_ids: list[int] = []
+    try:
+        with conn.cursor() as cur:
+            _insert_cities(cur, load_gc, unload_gc)
+            for i in range(10):
+                price_type = 9 if i == 0 else 3
+                pid = _insert_price(
+                    cur,
+                    date(2099, 10, 10),
+                    load_gc,
+                    unload_gc,
+                    price=20000.0 + i,
+                    price_type=price_type,
+                    organization_id=5000 + i,
+                )
+                price_ids.append(pid)
+                cur.execute(
+                    "INSERT INTO public.price_dates (price_id, price_date) VALUES (%s, %s)",
+                    (pid, date(2099, 10, 10)),
+                )
+            # Type 2 with its own org must not be counted as a carrier.
+            extra = _insert_price(
+                cur,
+                date(2099, 10, 10),
+                load_gc,
+                unload_gc,
+                price=26000.0,
+                price_type=2,
+                organization_id=5999,
+            )
+            price_ids.append(extra)
+            cur.execute(
+                "INSERT INTO public.price_dates (price_id, price_date) VALUES (%s, %s)",
+                (extra, date(2099, 10, 10)),
+            )
+        conn.commit()
+        run_etl_transaction(conn, date(2099, 10, 1), date(2099, 11, 1), as_of)
+        conn.commit()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT trips_count, carriers_count, reliability_level
+                FROM mart.route_card
+                WHERE loading_city_gcid = %s AND unloading_city_gcid = %s
+                """,
+                (load_gc, unload_gc),
+            )
+            row = cur.fetchone()
+        assert int(row[0]) == 11
+        assert int(row[1]) == 10  # types 3 and 9 only; the type-2 org is excluded
+        assert row[2] == "MEDIUM"
+    finally:
+        _cleanup(conn, price_ids, [load_gc, unload_gc])

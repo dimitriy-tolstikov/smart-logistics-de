@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import etl.config as config
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_pg_conn_kwargs_from_postgres_env_without_database_url(monkeypatch) -> None:
@@ -44,3 +48,10 @@ def test_pg_conn_kwargs_prefers_database_url(monkeypatch) -> None:
     assert kwargs["password"] == "custom_password"
     assert kwargs["dbname"] == "custom_db"
     assert kwargs["host"] == "db"
+
+
+def test_compose_app_dsn_uses_the_same_postgres_variables() -> None:
+    text = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    app_block = text.split("  app:", 1)[1].split("\n  # --- bonus", 1)[0]
+    assert "DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-deals_bigdata}" in app_block
+    assert "postgresql://postgres:postgres@db:5432/deals_bigdata" not in app_block

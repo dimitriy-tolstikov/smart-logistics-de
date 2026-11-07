@@ -6,14 +6,21 @@ import inspect
 import math
 from datetime import date, timedelta
 
+import numpy as np
+
 from ml.train_predict import (
     CAT_COLS,
+    INSERT_PRED_SQL,
     NUM_COLS,
     _mask_test,
     _mask_train,
     _parse_region,
+    build_model,
+    cyclic_date_features,
     load_training_table,
+    main,
     ml_split_bounds,
+    score_actuals,
 )
 
 
@@ -45,16 +52,16 @@ def test_parse_region_from_full_name_local() -> None:
 
 
 def test_cyclic_feature_math_for_known_date() -> None:
-    ld = date(2026, 10, 26)
-    doy = ld.timetuple().tm_yday
-    month = ld.month
-    dow = ld.weekday()
-    assert math.isclose(math.sin(2 * math.pi * doy / 365.25), math.sin(2 * math.pi * 299 / 365.25))
-    assert math.isclose(
-        math.cos(2 * math.pi * (month - 1) / 12.0),
-        math.cos(2 * math.pi * 9 / 12.0),
-    )
-    assert math.isclose(math.sin(2 * math.pi * dow / 7.0), math.sin(2 * math.pi * 0 / 7.0))
+    feats = cyclic_date_features(date(2026, 10, 26))
+    assert feats["doy"] == 299
+    assert feats["month"] == 10
+    assert feats["dow"] == 0
+    assert math.isclose(feats["sin_doy"], math.sin(2 * math.pi * 299 / 365.25))
+    assert math.isclose(feats["cos_doy"], math.cos(2 * math.pi * 299 / 365.25))
+    assert math.isclose(feats["sin_month"], math.sin(2 * math.pi * 9 / 12.0))
+    assert math.isclose(feats["cos_month"], math.cos(2 * math.pi * 9 / 12.0))
+    assert math.isclose(feats["sin_dow"], 0.0, abs_tol=1e-12)
+    assert math.isclose(feats["cos_dow"], 1.0, abs_tol=1e-12)
 
 
 def test_feature_columns_exclude_forbidden_target_fields() -> None:
@@ -89,15 +96,25 @@ def test_feature_columns_exclude_forbidden_target_fields() -> None:
 
 def test_future_scoring_null_rule() -> None:
     as_of = date(2026, 10, 26)
-    actual_price = 100_000.0
-    yhat = 90_000.0
+    assert score_actuals(as_of, 100_000.0, 90_000.0, as_of) == (100_000.0, 10_000.0, 10.0)
+    assert score_actuals(as_of + timedelta(days=1), 100_000.0, 90_000.0, as_of) == (None, None, None)
+    assert "scored_at" not in INSERT_PRED_SQL
+    src = inspect.getsource(main)
+    assert "model.fit(train_pool)" in src
+    assert "eval_set=" not in src
+    assert "shuffle=" not in src
+    assert "score_actuals(" in src
 
-    def score_fields(loading_date: date) -> tuple[float | None, float | None, float | None]:
-        is_future = loading_date > as_of
-        actual = None if is_future else actual_price
-        abs_err = None if actual is None else abs(actual - yhat)
-        ape = None if actual is None or actual == 0 else abs((actual - yhat) / actual) * 100.0
-        return actual, abs_err, ape
 
-    assert score_fields(as_of) == (actual_price, 10_000.0, 10.0)
-    assert score_fields(as_of + timedelta(days=1)) == (None, None, None)
+def test_repeat_fit_is_deterministic() -> None:
+    rng = np.random.default_rng(1)
+    features = rng.normal(size=(24, 6))
+    target = features[:, 0] * 5.0 + 1.0
+    fitted = []
+    for _ in range(2):
+        model = build_model(iterations=20)
+        model.fit(features, target)
+        fitted.append(model.predict(features))
+    assert model.get_params()["random_seed"] == 42
+    assert model.get_params()["thread_count"] == 1
+    assert np.allclose(fitted[0], fitted[1])
