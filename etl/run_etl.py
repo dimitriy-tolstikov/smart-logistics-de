@@ -38,21 +38,29 @@ def _dsn() -> str:
     )
 
 
-def run_etl_transaction(conn: psycopg.Connection, start: date, end: date, as_of: date) -> None:
+def run_etl_transaction(conn: psycopg.Connection, start: date, end: date, as_of: date) -> dict[str, int]:
     """
     Load window [start, end) into core/dq and rebuild affected routes for as_of.
 
     Idempotent for a fixed window: delete+reload is encapsulated in the SQL scripts
     (see load_core_delete_* / load_core_insert_*).
+
+    Returns statement row counts for the current window (deleted and inserted rows,
+    not the size of the whole mart).
     """
+    counts: dict[str, int] = {}
     with conn.transaction():
         params = {"start_date": start, "end_date": end, "as_of": as_of}
         with conn.cursor() as cur:
             cur.execute(read_sql(REFRESH_ROUTE_CARD_SQL_FILES[0]), params)
+            counts["routes_prepared"] = cur.rowcount
             for name in LOAD_CORE_SQL_FILES:
                 cur.execute(read_sql(name), params)
+                counts[name.removesuffix(".sql")] = cur.rowcount
             for name in REFRESH_ROUTE_CARD_SQL_FILES[1:]:
                 cur.execute(read_sql(name), params)
+                counts[name.removesuffix(".sql")] = cur.rowcount
+    return counts
 
 
 def _start_run(start: date, end: date, as_of: date) -> int:
@@ -184,8 +192,9 @@ def main() -> None:
                 )
                 routes_touched = int(cur.fetchone()[0])
 
-            run_etl_transaction(conn, start, end, as_of)
+            step_counts = run_etl_transaction(conn, start, end, as_of)
             stats = _collect_window_stats(conn, start, end, mart_before, routes_touched)
+            stats["step_rowcounts"] = step_counts
             conn.commit()
 
         _finish_run(run_id, status="success", stats=stats)
