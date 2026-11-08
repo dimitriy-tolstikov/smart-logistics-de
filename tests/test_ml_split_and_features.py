@@ -12,15 +12,21 @@ from ml.train_predict import (
     CAT_COLS,
     INSERT_PRED_SQL,
     NUM_COLS,
+    _mask_fit,
     _mask_test,
     _mask_train,
+    _mask_val,
     _parse_region,
     build_model,
     cyclic_date_features,
     load_training_table,
     main,
+    ml_fit_val_bounds,
     ml_split_bounds,
+    rare_body_group_mask,
     score_actuals,
+    segment_sample_weights,
+    select_and_fit_model,
 )
 
 
@@ -30,6 +36,18 @@ def test_ml_split_bounds_for_default_as_of() -> None:
     assert train_end_excl == date(2026, 10, 5)
     assert test_start == date(2026, 10, 5)
     assert test_end_incl == date(2026, 10, 26)
+
+
+def test_ml_fit_val_bounds_inside_train() -> None:
+    fit_start, val_start, val_end = ml_fit_val_bounds(date(2026, 7, 26), date(2026, 10, 5))
+    assert fit_start == date(2026, 7, 26)
+    assert val_start == date(2026, 9, 21)
+    assert val_end == date(2026, 10, 5)
+    assert _mask_fit(date(2026, 9, 20)) is True
+    assert _mask_fit(val_start) is False
+    assert _mask_val(val_start) is True
+    assert _mask_val(date(2026, 10, 4)) is True
+    assert _mask_val(val_end) is False
 
 
 def test_ml_split_masks_and_first_future_date() -> None:
@@ -99,11 +117,35 @@ def test_future_scoring_null_rule() -> None:
     assert score_actuals(as_of, 100_000.0, 90_000.0, as_of) == (100_000.0, 10_000.0, 10.0)
     assert score_actuals(as_of + timedelta(days=1), 100_000.0, 90_000.0, as_of) == (None, None, None)
     assert "scored_at" not in INSERT_PRED_SQL
-    src = inspect.getsource(main)
-    assert "model.fit(train_pool)" in src
-    assert "eval_set=" not in src
-    assert "shuffle=" not in src
-    assert "score_actuals(" in src
+    main_src = inspect.getsource(main)
+    fit_src = inspect.getsource(select_and_fit_model)
+    assert "select_and_fit_model(" in main_src
+    assert "score_actuals(" in main_src
+    assert "shuffle=" not in main_src
+    assert "eval_set=" not in fit_src
+    assert "X_test" not in fit_src
+    assert "y_test" not in fit_src
+    assert "FINAL_ITERATIONS" in fit_src
+
+
+def test_segment_sample_weights_boost_rare_categories() -> None:
+    # Columns: weight_category, volume, load_region, unload_region, body_group
+    X = np.array(
+        [
+            ["light", "v", "r1", "r2", "common"],
+            ["light", "v", "r1", "r2", "common"],
+            ["light", "v", "r1", "r2", "common"],
+            ["heavy", "v", "r1", "r2", "rare"],
+        ],
+        dtype=object,
+    )
+    weights = segment_sample_weights(X)
+    assert weights.shape == (4,)
+    assert 0.9 <= float(weights.mean()) <= 1.1
+    assert weights[3] > weights[0]
+
+    rare_mask = rare_body_group_mask(X[:, 4], np.array(["rare", "common"], dtype=object))
+    assert rare_mask.tolist() == [True, False]
 
 
 def test_repeat_fit_is_deterministic() -> None:

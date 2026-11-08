@@ -1,6 +1,13 @@
 """
 Feature engineering, time-based train/test split, CatBoost training, batch scoring.
 Uses NumPy + psycopg (no pandas) for fewer heavy native build deps.
+
+Validation and segment handling:
+- Holdout ``test`` stays a pure time-based exam and is never used as ``eval_set``.
+- Inside ``train``, the last ``VAL_WEEKS`` form a chronological validation fold for a
+  small hyper-parameter search; the winner is refit on the full official train window.
+- Mild inverse-frequency sample weights on ``body_group`` × ``weight_category`` lift
+  rare segments without changing the official train/test calendar windows.
 """
 
 from __future__ import annotations
@@ -8,6 +15,7 @@ from __future__ import annotations
 import calendar
 import logging
 import math
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Sequence
@@ -21,7 +29,20 @@ from etl.config import AS_OF, ML_RANDOM_SEED, pg_conn_kwargs
 
 LOG = logging.getLogger("ml.train_predict")
 
-MODEL_NAME = "catboost_regressor_v1"
+MODEL_NAME = "catboost_regressor_v2"
+VAL_WEEKS = 2
+FINAL_ITERATIONS = 400
+# Mild inverse-frequency clip: stronger boosts overfit noisy rare segments on this data.
+WEIGHT_CLIP = (0.7, 2.0)
+# Prefer overall val quality, but keep a penalty for rare body_group MAPE.
+VAL_RARE_MIX = 0.35
+# Small time-safe grid; scored on the inner validation fold only.
+PARAM_GRID: Sequence[dict[str, float | int]] = (
+    {"depth": 6, "learning_rate": 0.08},
+    {"depth": 8, "learning_rate": 0.08},
+    {"depth": 8, "learning_rate": 0.05},
+    {"depth": 10, "learning_rate": 0.05},
+)
 
 
 def _add_months(d: date, months: int) -> date:
@@ -46,7 +67,31 @@ def ml_split_bounds(as_of: date) -> tuple[date, date, date, date]:
     return train_start, train_end_excl, test_start, test_end_incl
 
 
+def ml_fit_val_bounds(
+    train_start: date,
+    train_end_excl: date,
+    *,
+    val_weeks: int = VAL_WEEKS,
+) -> tuple[date, date, date]:
+    """
+    Chronological fit/val split inside the official train window.
+
+    fit: [train_start, val_start)
+    val: [val_start, train_end_excl)
+    """
+    if val_weeks < 1:
+        raise ValueError("val_weeks must be >= 1")
+    val_start = train_end_excl - timedelta(weeks=val_weeks)
+    if val_start <= train_start:
+        # Degenerate window: keep at least one day for fit when possible.
+        val_start = train_start + timedelta(days=1)
+    if val_start >= train_end_excl:
+        val_start = train_start
+    return train_start, val_start, train_end_excl
+
+
 TRAIN_START, TRAIN_END_EXCL, TEST_START, TEST_END_INCL = ml_split_bounds(AS_OF)
+FIT_START, VAL_START, VAL_END_EXCL = ml_fit_val_bounds(TRAIN_START, TRAIN_END_EXCL)
 
 INSERT_PRED_SQL = """
 INSERT INTO mart.ml_price_predictions (
@@ -116,11 +161,16 @@ def score_actuals(
     return actual, abs_err, ape
 
 
-def build_model(*, iterations: int = 400) -> CatBoostRegressor:
+def build_model(
+    *,
+    iterations: int = FINAL_ITERATIONS,
+    depth: int = 8,
+    learning_rate: float = 0.08,
+) -> CatBoostRegressor:
     return CatBoostRegressor(
         loss_function="RMSE",
-        depth=8,
-        learning_rate=0.08,
+        depth=depth,
+        learning_rate=learning_rate,
         iterations=iterations,
         random_seed=ML_RANDOM_SEED,
         thread_count=1,
@@ -136,6 +186,9 @@ CAT_COLS: Sequence[str] = (
     "unloading_region",
     "body_group",
 )
+
+WEIGHT_CATEGORY_COL = 0
+BODY_GROUP_COL = 4
 
 NUM_COLS: Sequence[str] = (
     "distance",
@@ -319,8 +372,73 @@ def _mask_train(d: date) -> bool:
     return TRAIN_START <= d < TRAIN_END_EXCL
 
 
+def _mask_fit(d: date) -> bool:
+    return FIT_START <= d < VAL_START
+
+
+def _mask_val(d: date) -> bool:
+    return VAL_START <= d < VAL_END_EXCL
+
+
 def _mask_test(d: date) -> bool:
     return TEST_START <= d <= TEST_END_INCL
+
+
+def segment_sample_weights(
+    feature_matrix: np.ndarray,
+    *,
+    reference_matrix: np.ndarray | None = None,
+    weight_clip: tuple[float, float] = WEIGHT_CLIP,
+) -> np.ndarray:
+    """
+    Inverse-frequency weights for body_group × weight_category.
+
+    Frequencies are estimated on ``reference_matrix`` (defaults to ``feature_matrix``)
+    so a validation fold can reuse fit-period rarity. Mean weight is normalized to
+    1.0; values are clipped for stability.
+    """
+    n = feature_matrix.shape[0]
+    if n == 0:
+        return np.empty(0, dtype=np.float64)
+
+    ref = feature_matrix if reference_matrix is None else reference_matrix
+    if ref.shape[0] == 0:
+        return np.ones(n, dtype=np.float64)
+
+    ref_wc = ref[:, WEIGHT_CATEGORY_COL].astype(str)
+    ref_bg = ref[:, BODY_GROUP_COL].astype(str)
+    wc_counts = Counter(ref_wc.tolist())
+    bg_counts = Counter(ref_bg.tolist())
+    n_ref = ref.shape[0]
+
+    wc = feature_matrix[:, WEIGHT_CATEGORY_COL].astype(str)
+    bg = feature_matrix[:, BODY_GROUP_COL].astype(str)
+
+    lo, hi = weight_clip
+    raw = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        # Unseen-in-ref categories get count=1 → treated as rare, which is conservative.
+        inv = math.sqrt(
+            (n_ref / max(wc_counts.get(wc[i], 1), 1))
+            * (n_ref / max(bg_counts.get(bg[i], 1), 1))
+        )
+        raw[i] = inv
+
+    mean_w = float(raw.mean())
+    if mean_w <= 0:
+        return np.ones(n, dtype=np.float64)
+    # Clip after mean-normalization; mean may drift slightly above/below 1.0.
+    return np.clip(raw / mean_w, lo, hi).astype(np.float64)
+
+
+def rare_body_group_mask(train_body_groups: np.ndarray, eval_body_groups: np.ndarray) -> np.ndarray:
+    """Mark eval rows whose body_group frequency in train is at/below the train median."""
+    counts = Counter(train_body_groups.astype(str).tolist())
+    if not counts:
+        return np.zeros(len(eval_body_groups), dtype=bool)
+    median_freq = float(np.median(np.array(list(counts.values()), dtype=np.float64)))
+    rare = {k for k, v in counts.items() if v <= median_freq}
+    return np.array([str(g) in rare for g in eval_body_groups], dtype=bool)
 
 
 def write_predictions(dsn: str, out_rows: Sequence[tuple]) -> None:
@@ -330,6 +448,19 @@ def write_predictions(dsn: str, out_rows: Sequence[tuple]) -> None:
             for i in range(0, len(out_rows), BATCH_INSERT_SIZE):
                 chunk = out_rows[i : i + BATCH_INSERT_SIZE]
                 cur.executemany(INSERT_PRED_SQL, chunk)
+
+
+def _metrics_from_predictions(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+) -> tuple[float, float, float, float]:
+    if y_true.shape[0] == 0:
+        return float("nan"), float("nan"), float("nan"), float("nan")
+    rmse = float(mean_squared_error(y_true, y_pred) ** 0.5)
+    mae = float(mean_absolute_error(y_true, y_pred))
+    r2 = float(r2_score(y_true, y_pred))
+    mape = float(mean_absolute_percentage_error(y_true, y_pred) * 100.0)
+    return rmse, mae, r2, mape
 
 
 def _evaluate_test_split(
@@ -344,11 +475,128 @@ def _evaluate_test_split(
 
     test_pool = Pool(X_test, label=y_test, cat_features=cat_feat_idx)
     pred_test = model.predict(test_pool)
-    rmse = float(mean_squared_error(y_test, pred_test) ** 0.5)
-    mae = float(mean_absolute_error(y_test, pred_test))
-    r2 = float(r2_score(y_test, pred_test))
-    mape = float(mean_absolute_percentage_error(y_test, pred_test) * 100.0)
-    return rmse, mae, r2, mape
+    return _metrics_from_predictions(y_test, pred_test)
+
+
+def _log_segment_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    rare_mask: np.ndarray,
+    *,
+    label: str,
+) -> None:
+    if y_true.shape[0] == 0:
+        return
+    rare = rare_mask.astype(bool)
+    common = ~rare
+    for name, mask in (("rare_body", rare), ("common_body", common)):
+        if not mask.any():
+            continue
+        _rmse, mae, _r2, mape = _metrics_from_predictions(y_true[mask], y_pred[mask])
+        LOG.info(
+            "%s segment %s — n=%s MAPE=%.2f%% MAE=%.2f",
+            label,
+            name,
+            int(mask.sum()),
+            mape,
+            mae,
+        )
+
+
+def select_and_fit_model(
+    X_fit: np.ndarray,
+    y_fit: np.ndarray,
+    w_fit: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    w_val: np.ndarray,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    w_train: np.ndarray,
+    cat_feat_idx: Sequence[int],
+    *,
+    fit_body_groups: np.ndarray | None = None,
+    val_body_groups: np.ndarray | None = None,
+) -> CatBoostRegressor:
+    """
+    Tune on the inner time-based val fold, then refit on the full official train window.
+
+    The holdout test set is intentionally never passed here.
+    """
+    fit_pool = Pool(X_fit, label=y_fit, weight=w_fit, cat_features=cat_feat_idx)
+    # Val weights keep the same segment emphasis while choosing early-stop / params.
+    val_pool = Pool(X_val, label=y_val, weight=w_val, cat_features=cat_feat_idx)
+
+    best_score = float("inf")
+    best_mape = float("inf")
+    best_params: dict[str, float | int] = dict(PARAM_GRID[0])
+
+    if X_val.shape[0] == 0:
+        LOG.warning("Inner validation fold is empty — falling back to default params")
+        model = build_model(
+            iterations=FINAL_ITERATIONS,
+            depth=int(best_params["depth"]),
+            learning_rate=float(best_params["learning_rate"]),
+        )
+        train_pool = Pool(X_train, label=y_train, weight=w_train, cat_features=cat_feat_idx)
+        model.fit(train_pool)
+        return model
+
+    rare_val = None
+    if fit_body_groups is not None and val_body_groups is not None and len(val_body_groups):
+        rare_val = rare_body_group_mask(fit_body_groups, val_body_groups)
+
+    for params in PARAM_GRID:
+        depth = int(params["depth"])
+        lr = float(params["learning_rate"])
+        # Score the same iteration budget as the final refit; early stopping here
+        # made val ranks diverge from the full-train model quality.
+        candidate = build_model(
+            iterations=FINAL_ITERATIONS,
+            depth=depth,
+            learning_rate=lr,
+        )
+        candidate.fit(fit_pool)
+        pred_val = candidate.predict(val_pool)
+        _rmse, _mae, _r2, mape = _metrics_from_predictions(y_val, pred_val)
+        rare_mape = mape
+        if rare_val is not None and rare_val.any():
+            rare_mape = _metrics_from_predictions(y_val[rare_val], pred_val[rare_val])[3]
+        score = (1.0 - VAL_RARE_MIX) * mape + VAL_RARE_MIX * rare_mape
+        used_iter = int(candidate.tree_count_)
+        LOG.info(
+            "Val candidate depth=%s lr=%.3f trees=%s MAPE=%.2f%% rare_MAPE=%.2f%% score=%.2f",
+            depth,
+            lr,
+            used_iter,
+            mape,
+            rare_mape,
+            score,
+        )
+        if score < best_score:
+            best_score = score
+            best_mape = mape
+            best_params = {"depth": depth, "learning_rate": lr}
+
+    LOG.info(
+        "Selected params depth=%s lr=%.3f final_iterations=%s (val MAPE=%.2f%% score=%.2f)",
+        best_params["depth"],
+        best_params["learning_rate"],
+        FINAL_ITERATIONS,
+        best_mape,
+        best_score,
+    )
+
+    # Refit on the full official train window with a fixed budget — do not carry the
+    # shortened early-stopped tree count from the fit fold (it underfits full train).
+    final_model = build_model(
+        iterations=FINAL_ITERATIONS,
+        depth=int(best_params["depth"]),
+        learning_rate=float(best_params["learning_rate"]),
+    )
+    train_pool = Pool(X_train, label=y_train, weight=w_train, cat_features=cat_feat_idx)
+    final_model.fit(train_pool)
+    return final_model
 
 
 def main() -> None:
@@ -367,26 +615,64 @@ def main() -> None:
     n = len(tbl.loading_date)
     idx_all = np.arange(n, dtype=np.int64)
     train_idx = np.array([i for i in idx_all if _mask_train(tbl.loading_date[i])], dtype=np.int64)
+    fit_idx = np.array([i for i in idx_all if _mask_fit(tbl.loading_date[i])], dtype=np.int64)
+    val_idx = np.array([i for i in idx_all if _mask_val(tbl.loading_date[i])], dtype=np.int64)
     test_idx = np.array([i for i in idx_all if _mask_test(tbl.loading_date[i])], dtype=np.int64)
 
     cat_feat_idx = list(range(len(CAT_COLS)))
 
     X_train = tbl.feature_matrix[train_idx]
     y_train = tbl.price_rub[train_idx]
+    X_fit = tbl.feature_matrix[fit_idx]
+    y_fit = tbl.price_rub[fit_idx]
+    X_val = tbl.feature_matrix[val_idx]
+    y_val = tbl.price_rub[val_idx]
     X_test = tbl.feature_matrix[test_idx]
     y_test = tbl.price_rub[test_idx]
     if X_train.shape[0] == 0:
         raise RuntimeError("Train split is empty — check the ETL window and training dates")
+    if X_fit.shape[0] == 0:
+        raise RuntimeError("Fit split is empty — check VAL_WEEKS against the train window")
 
-    train_pool = Pool(X_train, label=y_train, cat_features=cat_feat_idx)
+    # Fit-period rarity for the search stage; full-train rarity for the final refit.
+    w_fit = segment_sample_weights(X_fit)
+    w_val = (
+        segment_sample_weights(X_val, reference_matrix=X_fit)
+        if X_val.shape[0]
+        else np.empty(0, dtype=np.float64)
+    )
+    w_train = segment_sample_weights(X_train)
 
-    model = build_model()
-    LOG.info("Training CatBoost: train=%s test=%s", X_train.shape[0], X_test.shape[0])
-    # Do not pass test as eval_set — that would leak the holdout into training dynamics.
-    model.fit(train_pool)
+    LOG.info(
+        "Training CatBoost: fit=%s val=%s train=%s test=%s",
+        X_fit.shape[0],
+        X_val.shape[0],
+        X_train.shape[0],
+        X_test.shape[0],
+    )
+    model = select_and_fit_model(
+        X_fit,
+        y_fit,
+        w_fit,
+        X_val,
+        y_val,
+        w_val,
+        X_train,
+        y_train,
+        w_train,
+        cat_feat_idx,
+        fit_body_groups=tbl.body_group[fit_idx],
+        val_body_groups=tbl.body_group[val_idx] if len(val_idx) else None,
+    )
 
     rmse, mae, r2, mape = _evaluate_test_split(model, X_test, y_test, cat_feat_idx)
     LOG.info("Test metrics — R2=%.4f MAPE=%.2f%% RMSE=%.2f MAE=%.2f", r2, mape, rmse, mae)
+
+    if X_test.shape[0]:
+        test_pool = Pool(X_test, cat_features=cat_feat_idx)
+        pred_test = model.predict(test_pool)
+        rare_mask = rare_body_group_mask(tbl.body_group[train_idx], tbl.body_group[test_idx])
+        _log_segment_metrics(y_test, pred_test, rare_mask, label="Test")
 
     score_idx = np.array(
         [i for i in idx_all if _mask_test(tbl.loading_date[i]) or tbl.loading_date[i] > as_of],
