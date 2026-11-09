@@ -8,6 +8,12 @@ Validation and segment handling:
   small hyper-parameter search; the winner is refit on the full official train window.
 - Mild inverse-frequency sample weights on ``body_group`` × ``weight_category`` lift
   rare segments without changing the official train/test calendar windows.
+- The target is the carrier rate (``price_type`` 3 and 9). The market corridor still
+  uses every factual type. A deal contributes one canonical body group, the minimum
+  ``std_id``, so the score joins the route card on that group and ``weight_category``.
+- ``lag_median_trip`` is the previous calendar month median of the same cell. The
+  current month is excluded. ``ML_TUNE=1`` runs the small grid; otherwise the fit
+  uses the already selected depth and learning rate.
 """
 
 from __future__ import annotations
@@ -25,11 +31,13 @@ import psycopg
 from catboost import CatBoostRegressor, Pool
 from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error, mean_squared_error, r2_score
 
-from etl.config import AS_OF, ML_RANDOM_SEED, pg_conn_kwargs
+from etl.config import AS_OF, ML_RANDOM_SEED, ml_tune_enabled, pg_conn_kwargs
 
 LOG = logging.getLogger("ml.train_predict")
 
-MODEL_NAME = "catboost_regressor_v2"
+MODEL_NAME = "catboost_regressor_v3"
+DEFAULT_DEPTH = 8
+DEFAULT_LEARNING_RATE = 0.08
 VAL_WEEKS = 2
 FINAL_ITERATIONS = 400
 # Mild inverse-frequency clip: stronger boosts overfit noisy rare segments on this data.
@@ -96,8 +104,9 @@ FIT_START, VAL_START, VAL_END_EXCL = ml_fit_val_bounds(TRAIN_START, TRAIN_END_EX
 INSERT_PRED_SQL = """
 INSERT INTO mart.ml_price_predictions (
     price_id, loading_date, loading_city_gcid, unloading_city_gcid, body_group,
+    weight_category, body_group_std_id,
     actual_price_rub, predicted_price_rub, abs_error_rub, ape_pct, model_name
-) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 """
 BATCH_INSERT_SIZE = 5000
 
@@ -120,7 +129,8 @@ def _body_group(row_groups: object) -> str:
     return str(row_groups)
 
 
-def _safe_float(x: object) -> float:
+def _optional_float(x: object) -> float:
+    """Missing numbers stay NaN. CatBoost treats that as a gap, not as coordinate 0."""
     if x is None:
         return float("nan")
     return float(x)
@@ -208,6 +218,7 @@ NUM_COLS: Sequence[str] = (
     "cos_month",
     "sin_dow",
     "cos_dow",
+    "lag_median_trip",
 )
 
 
@@ -219,6 +230,8 @@ class TrainingTable:
     loading_city_gcid: np.ndarray
     unloading_city_gcid: np.ndarray
     body_group: np.ndarray
+    weight_category: np.ndarray
+    body_group_std_id: np.ndarray
     feature_matrix: np.ndarray  # shape (n, n_features), object dtype for mixed str/float
 
 
@@ -236,9 +249,37 @@ def load_training_table(conn: psycopg.Connection) -> TrainingTable:
     body_std AS (
         SELECT
             price_id,
-            string_agg(body_group_std_id::text, '|' ORDER BY body_group_std_id) AS body_group_key
+            MIN(body_group_std_id) AS body_group_std_id
         FROM core.price_body_group
         GROUP BY price_id
+    ),
+    market AS (
+        SELECT
+            date_trunc('month', f.loading_date)::date AS month,
+            f.loading_city_gcid,
+            f.unloading_city_gcid,
+            bs.body_group_std_id,
+            f.weight_category,
+            f.price_rub
+        FROM core.fact_prices f
+        JOIN body_std bs ON bs.price_id = f.price_id
+        WHERE f.is_fact
+          AND NOT f.complex
+          AND COALESCE(f.outlier_mark, false) IS NOT TRUE
+          AND f.price_rub > 0
+          AND f.distance > 0
+          AND f.loading_date <= %(as_of)s::date
+    ),
+    cell_month AS (
+        SELECT
+            month,
+            loading_city_gcid,
+            unloading_city_gcid,
+            body_group_std_id,
+            weight_category,
+            percentile_cont(0.5) WITHIN GROUP (ORDER BY price_rub) AS median_trip
+        FROM market
+        GROUP BY 1, 2, 3, 4, 5
     )
     SELECT
         f.price_id,
@@ -257,12 +298,19 @@ def load_training_table(conn: psycopg.Connection) -> TrainingTable:
         lc.longitude AS load_lon,
         uc.latitude AS unload_lat,
         uc.longitude AS unload_lon,
-        bs.body_group_key AS body_std_raw
+        bs.body_group_std_id,
+        lag.median_trip AS lag_median_trip
     FROM core.fact_prices f
     JOIN public.prices p ON p.id = f.price_id
     JOIN dedup lc ON lc.gc_id = f.loading_city_gcid
     JOIN dedup uc ON uc.gc_id = f.unloading_city_gcid
     JOIN body_std bs ON bs.price_id = f.price_id
+    LEFT JOIN cell_month lag
+      ON lag.loading_city_gcid = f.loading_city_gcid
+     AND lag.unloading_city_gcid = f.unloading_city_gcid
+     AND lag.body_group_std_id = bs.body_group_std_id
+     AND lag.weight_category = f.weight_category
+     AND lag.month = (date_trunc('month', f.loading_date)::date - INTERVAL '1 month')::date
     WHERE f.price_rub > 0
       AND f.distance > 0
       AND (
@@ -270,7 +318,8 @@ def load_training_table(conn: psycopg.Connection) -> TrainingTable:
               f.is_fact
               AND NOT f.complex
               AND COALESCE(f.outlier_mark, false) IS NOT TRUE
-              AND p.price_type IN (1, 2, 3, 4, 5, 9)
+              AND p.price_type IN (3, 9)
+              AND f.loading_date <= %(as_of)s::date
           )
           OR f.loading_date > %(as_of)s::date
       )
@@ -293,6 +342,8 @@ def load_training_table(conn: psycopg.Connection) -> TrainingTable:
     load_gc = np.empty(n, dtype=np.int64)
     unload_gc = np.empty(n, dtype=np.int64)
     body_group = np.empty(n, dtype=object)
+    weight_category = np.empty(n, dtype=object)
+    body_group_std_id = np.empty(n, dtype=np.int64)
 
     n_features = len(CAT_COLS) + len(NUM_COLS)
     X = np.empty((n, n_features), dtype=object)
@@ -307,31 +358,20 @@ def load_training_table(conn: psycopg.Connection) -> TrainingTable:
         vc = row[col_idx["volume_category"]] or ""
         _lcity, lregion = _parse_region(row[col_idx["load_full"]])
         _ucity, uregion = _parse_region(row[col_idx["unload_full"]])
-        bg = _body_group(row[col_idx["body_std_raw"]])
-
-        def nn(x: object) -> float:
-            v = _safe_float(x)
-            return 0.0 if math.isnan(v) else v
+        std_id = int(row[col_idx["body_group_std_id"]])
+        bg = _body_group(std_id)
 
         cal = cyclic_date_features(ld)
 
-        dist = _safe_float(row[col_idx["distance"]])
-        tw = _safe_float(row[col_idx["total_weight"]])
-        tv = _safe_float(row[col_idx["total_volume"]])
-        lla = nn(row[col_idx["load_lat"]])
-        llo = nn(row[col_idx["load_lon"]])
-        ula = nn(row[col_idx["unload_lat"]])
-        ulo = nn(row[col_idx["unload_lon"]])
-
         nums = np.array(
             [
-                dist,
-                tw,
-                tv,
-                lla,
-                llo,
-                ula,
-                ulo,
+                _optional_float(row[col_idx["distance"]]),
+                _optional_float(row[col_idx["total_weight"]]),
+                _optional_float(row[col_idx["total_volume"]]),
+                _optional_float(row[col_idx["load_lat"]]),
+                _optional_float(row[col_idx["load_lon"]]),
+                _optional_float(row[col_idx["unload_lat"]]),
+                _optional_float(row[col_idx["unload_lon"]]),
                 cal["year"],
                 cal["month"],
                 cal["dow"],
@@ -342,6 +382,7 @@ def load_training_table(conn: psycopg.Connection) -> TrainingTable:
                 cal["cos_month"],
                 cal["sin_dow"],
                 cal["cos_dow"],
+                _optional_float(row[col_idx["lag_median_trip"]]),
             ],
             dtype=np.float64,
         )
@@ -356,6 +397,8 @@ def load_training_table(conn: psycopg.Connection) -> TrainingTable:
         load_gc[i] = int(row[col_idx["loading_city_gcid"]])
         unload_gc[i] = int(row[col_idx["unloading_city_gcid"]])
         body_group[i] = bg
+        weight_category[i] = str(wc)
+        body_group_std_id[i] = std_id
 
     return TrainingTable(
         price_id=price_ids,
@@ -364,6 +407,8 @@ def load_training_table(conn: psycopg.Connection) -> TrainingTable:
         loading_city_gcid=load_gc,
         unloading_city_gcid=unload_gc,
         body_group=body_group,
+        weight_category=weight_category,
+        body_group_std_id=body_group_std_id,
         feature_matrix=X,
     )
 
@@ -439,6 +484,56 @@ def rare_body_group_mask(train_body_groups: np.ndarray, eval_body_groups: np.nda
     median_freq = float(np.median(np.array(list(counts.values()), dtype=np.float64)))
     rare = {k for k, v in counts.items() if v <= median_freq}
     return np.array([str(g) in rare for g in eval_body_groups], dtype=bool)
+
+
+def write_ml_run(
+    dsn: str,
+    *,
+    as_of: date,
+    depth: int,
+    learning_rate: float,
+    tuned: bool,
+    train_rows: int,
+    test_rows: int,
+    rmse: float,
+    mae: float,
+    r2: float,
+    mape: float,
+    scored_rows: int,
+) -> None:
+    """Persist holdout metrics. NaN becomes SQL NULL."""
+
+    def _num(value: float) -> float | None:
+        if math.isnan(value):
+            return None
+        return float(value)
+
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO etl_meta.ml_runs (
+                    as_of, model_name, depth, learning_rate, iterations, tuned,
+                    train_rows, test_rows, r2, mape_pct, rmse, mae, scored_rows
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    as_of,
+                    MODEL_NAME,
+                    depth,
+                    learning_rate,
+                    FINAL_ITERATIONS,
+                    tuned,
+                    train_rows,
+                    test_rows,
+                    _num(r2),
+                    _num(mape),
+                    _num(rmse),
+                    _num(mae),
+                    scored_rows,
+                ),
+            )
+        conn.commit()
 
 
 def write_predictions(dsn: str, out_rows: Sequence[tuple]) -> None:
@@ -517,12 +612,32 @@ def select_and_fit_model(
     *,
     fit_body_groups: np.ndarray | None = None,
     val_body_groups: np.ndarray | None = None,
+    tune: bool | None = None,
 ) -> CatBoostRegressor:
     """
     Tune on the inner time-based val fold, then refit on the full official train window.
 
-    The holdout test set is intentionally never passed here.
+    The holdout test set is intentionally never passed here. With tuning disabled the
+    fit uses the fixed depth and learning rate chosen on the snapshot.
     """
+    if tune is None:
+        tune = ml_tune_enabled()
+    if not tune:
+        LOG.info(
+            "ML_TUNE off — fixed params depth=%s lr=%.3f iterations=%s",
+            DEFAULT_DEPTH,
+            DEFAULT_LEARNING_RATE,
+            FINAL_ITERATIONS,
+        )
+        model = build_model(
+            iterations=FINAL_ITERATIONS,
+            depth=DEFAULT_DEPTH,
+            learning_rate=DEFAULT_LEARNING_RATE,
+        )
+        train_pool = Pool(X_train, label=y_train, weight=w_train, cat_features=cat_feat_idx)
+        model.fit(train_pool)
+        return model
+
     fit_pool = Pool(X_fit, label=y_fit, weight=w_fit, cat_features=cat_feat_idx)
     # Val weights keep the same segment emphasis while choosing early-stop / params.
     val_pool = Pool(X_val, label=y_val, weight=w_val, cat_features=cat_feat_idx)
@@ -666,7 +781,20 @@ def main() -> None:
     )
 
     rmse, mae, r2, mape = _evaluate_test_split(model, X_test, y_test, cat_feat_idx)
-    LOG.info("Test metrics — R2=%.4f MAPE=%.2f%% RMSE=%.2f MAE=%.2f", r2, mape, rmse, mae)
+    tuned = ml_tune_enabled()
+    fitted = model.get_all_params()
+    depth = int(fitted["depth"])
+    learning_rate = float(fitted["learning_rate"])
+    LOG.info(
+        "Test metrics (price_type 3 and 9) — R2=%.4f MAPE=%.2f%% RMSE=%.2f MAE=%.2f depth=%s lr=%.3f tuned=%s",
+        r2,
+        mape,
+        rmse,
+        mae,
+        depth,
+        learning_rate,
+        tuned,
+    )
 
     if X_test.shape[0]:
         test_pool = Pool(X_test, cat_features=cat_feat_idx)
@@ -696,6 +824,8 @@ def main() -> None:
                 int(tbl.loading_city_gcid[row_i]),
                 int(tbl.unloading_city_gcid[row_i]),
                 str(tbl.body_group[row_i]),
+                str(tbl.weight_category[row_i]) or None,
+                int(tbl.body_group_std_id[row_i]),
                 actual,
                 float(yhat),
                 abs_err,
@@ -705,6 +835,20 @@ def main() -> None:
         )
 
     write_predictions(dsn, out_rows)
+    write_ml_run(
+        dsn,
+        as_of=as_of,
+        depth=depth,
+        learning_rate=learning_rate,
+        tuned=tuned,
+        train_rows=int(X_train.shape[0]),
+        test_rows=int(X_test.shape[0]),
+        rmse=rmse,
+        mae=mae,
+        r2=r2,
+        mape=mape,
+        scored_rows=len(out_rows),
+    )
 
     LOG.info("Wrote %s scoring rows to mart.ml_price_predictions", len(out_rows))
 

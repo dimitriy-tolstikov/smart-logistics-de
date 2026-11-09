@@ -50,6 +50,22 @@ def test_pg_conn_kwargs_prefers_database_url(monkeypatch) -> None:
     assert kwargs["host"] == "db"
 
 
+def test_database_url_quotes_reserved_characters(monkeypatch) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("PGUSER", "user")
+    monkeypatch.setenv("PGPASSWORD", "p@ss:word")
+    monkeypatch.setenv("PGHOST", "db")
+    monkeypatch.setenv("PGPORT", "5432")
+    monkeypatch.setenv("PGDATABASE", "deals")
+
+    assert config.database_url() == "postgresql://user:p%40ss%3Aword@db:5432/deals"
+
+    monkeypatch.setenv("DATABASE_URL", config.database_url())
+    kwargs = config.pg_conn_kwargs()
+    assert kwargs["password"] == "p@ss:word"
+    assert kwargs["user"] == "user"
+
+
 def test_compose_app_dsn_uses_the_same_postgres_variables() -> None:
     text = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     app_block = text.split("  app:", 1)[1].split("\n  # --- bonus", 1)[0]

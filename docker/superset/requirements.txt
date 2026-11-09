@@ -1,2 +1,4 @@
 psycopg2-binary==2.9.10
+# Dialect clickhousedb+connect speaks HTTP 8123. The sqlalchemy extra only pins
+# SQLAlchemy<2, which Superset 4.0 already satisfies, so the extra is not installed.
 clickhouse-connect==0.8.17

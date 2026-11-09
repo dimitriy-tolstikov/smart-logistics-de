@@ -35,9 +35,6 @@ echo "superset init..."
 superset init
 
 echo "Seed datasources + demo dashboard..."
-python /app/docker/create_dashboard.py || {
-  echo "WARN: dashboard seed failed (datasources may still be added manually in UI)"
-  exit 0
-}
+python /app/docker/create_dashboard.py
 
 echo "Superset bootstrap complete."

@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS mart.ml_price_predictions (
     loading_city_gcid     integer NOT NULL,
     unloading_city_gcid   integer NOT NULL,
     body_group            text NOT NULL,
+    weight_category       varchar(4),
+    body_group_std_id     integer,
     actual_price_rub      double precision,
     predicted_price_rub   double precision NOT NULL,
     abs_error_rub         double precision,
@@ -58,4 +60,12 @@ BEGIN
     END IF;
 END $$;
 
+ALTER TABLE mart.ml_price_predictions
+    ADD COLUMN IF NOT EXISTS weight_category varchar(4);
+
+ALTER TABLE mart.ml_price_predictions
+    ADD COLUMN IF NOT EXISTS body_group_std_id integer;
+
 CREATE INDEX IF NOT EXISTS mart_ml_pred_loading_date_idx ON mart.ml_price_predictions (loading_date);
+CREATE INDEX IF NOT EXISTS mart_ml_pred_cell_idx
+    ON mart.ml_price_predictions (loading_city_gcid, unloading_city_gcid, body_group_std_id, weight_category);

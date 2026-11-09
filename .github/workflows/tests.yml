@@ -1,0 +1,56 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: deals_bigdata
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d deals_bigdata"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      clickhouse:
+        image: clickhouse/clickhouse-server:24.8
+        env:
+          CLICKHOUSE_USER: default
+          CLICKHOUSE_PASSWORD: clickhouse
+          CLICKHOUSE_DB: default
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "clickhouse-client --user default --password clickhouse --query 'SELECT 1'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/deals_bigdata
+      PYTEST_REQUIRE_DB: "1"
+      CI: "1"
+      CLICKHOUSE_HOST: localhost
+      CLICKHOUSE_PORT: "8123"
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_DB: default
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install psql
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      - name: Run tests
+        run: pytest -q

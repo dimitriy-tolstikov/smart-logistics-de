@@ -1,13 +1,14 @@
 """
 Idempotent sync of PostgreSQL mart tables into ClickHouse (bonus ★).
 
-Full refresh: TRUNCATE + batched INSERT. Safe to re-run; results match Postgres.
+Load into an empty staging table, then EXCHANGE TABLES. A failed batch leaves the
+published mart untouched. CLICKHOUSE_SYNC_ENABLED is honored only by the app
+entrypoint; this module always syncs when invoked directly or from Airflow.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 
 import psycopg
@@ -49,6 +50,8 @@ ML_PRED_COLS = (
     "loading_city_gcid",
     "unloading_city_gcid",
     "body_group",
+    "weight_category",
+    "body_group_std_id",
     "actual_price_rub",
     "predicted_price_rub",
     "abs_error_rub",
@@ -112,7 +115,10 @@ def _fetch_batches(conn: psycopg.Connection, sql: str, cols: tuple[str, ...]):
             rows = cur.fetchmany(BATCH_SIZE)
             if not rows:
                 break
-            yield [[r[c] for c in cols] for r in rows]
+            if isinstance(rows[0], dict):
+                yield [[r[c] for c in cols] for r in rows]
+            else:
+                yield [list(r) for r in rows]
 
 
 def _sync_table(
@@ -123,12 +129,19 @@ def _sync_table(
     ch_table: str,
     cols: tuple[str, ...],
 ) -> int:
-    ch.command(f"TRUNCATE TABLE {ch_table}")
+    staging = f"{ch_table}__staging"
+    ch.command(f"DROP TABLE IF EXISTS {staging}")
+    ch.command(f"CREATE TABLE {staging} EMPTY AS {ch_table}")
     total = 0
-    for batch in _fetch_batches(pg, pg_sql, cols):
-        ch.insert(ch_table, batch, column_names=list(cols))
-        total += len(batch)
-        LOG.info("%s: inserted %s rows (running total %s)", ch_table, len(batch), total)
+    try:
+        for batch in _fetch_batches(pg, pg_sql, cols):
+            ch.insert(staging, batch, column_names=list(cols))
+            total += len(batch)
+            LOG.info("%s: staged %s rows (running total %s)", ch_table, len(batch), total)
+        ch.command(f"EXCHANGE TABLES {ch_table} AND {staging}")
+    except Exception:
+        ch.command(f"DROP TABLE IF EXISTS {staging}")
+        raise
     return total
 
 
@@ -166,9 +179,6 @@ def sync_marts() -> dict[str, int]:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    if os.getenv("CLICKHOUSE_SYNC_ENABLED", "1").lower() in {"0", "false", "no"}:
-        LOG.info("CLICKHOUSE_SYNC_ENABLED is off; skipping")
-        return
     sync_marts()
 
 

@@ -25,7 +25,7 @@
 - **ETL:** SQL-трансформации в `etl/sql/` + оркестратор `python -m etl.run_etl`. Повторный прогон удаляет строки как по сохранённой, так и по текущей дате источника, поэтому исправление `loading_date` не оставляет устаревших строк в `core` и `dq`.
 - **FX:** конвертация USD/EUR в RUB по курсу на дату `nearest_rate_date` (`exchange_rates`), совпадение `setting_date = nearest_rate_date`; строки без курса уходят в карантин.
 - **Витрина:** одна сделка попадает в каждую связанную бизнес-группу кузова без дублей внутри группы; fallback на `prices.body_type` действует только при отсутствии связей. Повторные `price_dates` внутри месяца не увеличивают вес сделки. Backfill пересчитывает полную историю только затронутых маршрутов, а не всю `route_card`; удаление и вставка выполняются в одной транзакции с Core/DQ. Для выборки окон и маршрутов используются индексы по `prices.loading_date`, `core.fact_prices.loading_date` и паре городов Core.
-- **ML:** `ml/train_predict.py` — признаки из `core`, дедуп справочника городов, детерминированная категория из всех групп кузова, циклические даты и **time split** от `AS_OF_DATE` (`train = [as_of−3м, as_of−3н)`, `test = [as_of−3н, as_of]`). Внутри `train` последние 2 недели — chronological val для выбора `depth`/`learning_rate`; финальный fit идёт на полном `train`. Мягкие inverse-frequency веса по `body_group` × `weight_category` поднимают редкие сегменты. Holdout `test` в `eval_set` не передаётся. CatBoost работает с фиксированным seed в один поток, входной набор отсортирован по `price_id`. Скорятся тестовый период и **все будущие заявки**, включая `price_type = 6`, сложные маршруты и строки с `outlier_mark = true`; для будущих заявок факт и ошибки равны `NULL`. Полная замена прогнозов выполняется в одной транзакции.
+- **ML:** `ml/train_predict.py` — признаки из `core`, дедуп справочника городов, одна каноническая группа кузова (`MIN(std_id)`, чтобы прогноз соединялся с ячейкой карточки), циклические даты, лаг `lag_median_trip` (медиана той же ячейки за предыдущий календарный месяц, без текущего месяца) и **time split** от `AS_OF_DATE` (`train = [as_of−3м, as_of−3н)`, `test = [as_of−3н, as_of]`). Таргет — ставка перевозчика, `price_type IN (3, 9)`. Рыночная витрина по-прежнему считает все фактические типы. По умолчанию `ML_TUNE=0`: fit с уже выбранными `depth=8`, `learning_rate=0.08`. `ML_TUNE=1` включает поиск по внутреннему chronological val (последние 2 недели `train`); holdout `test` в `eval_set` не передаётся. CatBoost работает с фиксированным seed в один поток, входной набор отсортирован по `price_id`. Скорятся тестовый период перевозчиков и **все будущие заявки**, включая `price_type = 6`, сложные маршруты и строки с `outlier_mark = true`; для будущих заявок факт и ошибки равны `NULL`. Пропуски координат остаются `NaN`. Метрики пишутся в лог и в `etl_meta.ml_runs`. Полная замена прогнозов выполняется в одной транзакции.
 - **★ Бонусный контур:** `dags/ul_etl_dag.py` (Airflow) → те же `etl.run_etl` / `ml.train_predict` → `etl.sync_clickhouse`; BI в Superset поверх Postgres и ClickHouse.
 
 Переменные окружения — см. [`.env.example`](.env.example). `DATABASE_URL` в Compose собирается из тех же `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB`, что и сервис `db`.
@@ -84,13 +84,13 @@ docker compose exec app python -m etl.sync_clickhouse
 | Superset | http://localhost:8088 | `admin` / `admin` |
 | ClickHouse HTTP | http://localhost:8123 | user `default`, password `clickhouse` |
 
-**Airflow.** DAG `ul_etl_ml_clickhouse`: `run_etl` → `train_predict` → `sync_clickhouse`. По умолчанию DAG на паузе; снимите паузу или Trigger DAG with config:
+**Airflow.** Ежедневный DAG `ul_etl_daily` грузит только свой data interval и синхронизирует ClickHouse, без переобучения. Полный прогон с моделью — ручной DAG `ul_etl_ml_clickhouse`: `run_etl` → `train_predict` → `sync_clickhouse`. Trigger DAG with config:
 
 ```json
 {"start_date": "2026-10-01", "end_date": "2026-11-01", "as_of": "2026-10-26"}
 ```
 
-**ClickHouse.** DDL: [`sql/clickhouse/01_mart_route_card.sql`](sql/clickhouse/01_mart_route_card.sql) (`ReplacingMergeTree`). Синхронизация:
+**ClickHouse.** DDL: [`sql/clickhouse/01_mart_route_card.sql`](sql/clickhouse/01_mart_route_card.sql) (`ReplacingMergeTree`). Синхронизация льёт данные в staging и делает `EXCHANGE TABLES`, поэтому обрыв пачки не опустошает опубликованную витрину. `python -m etl.sync_clickhouse` синхронизирует всегда. Флаг `CLICKHOUSE_SYNC_ENABLED` действует только на entrypoint обязательного `compose up`.
 
 ```bash
 # из контейнера app / airflow (когда ClickHouse доступен)
@@ -145,9 +145,24 @@ SELECT
 FROM mart.ml_price_predictions;
 ```
 
+Прогноз соединяется с карточкой по маршруту, канонической группе кузова и весу:
+
+```sql
+SELECT rc.month, rc.median_trip, rc.p25_trip, rc.p75_trip, p.predicted_price_rub
+FROM mart.route_card rc
+JOIN mart.ml_price_predictions p
+  ON p.loading_city_gcid = rc.loading_city_gcid
+ AND p.unloading_city_gcid = rc.unloading_city_gcid
+ AND p.body_group_std_id = rc.body_group_std_id
+ AND p.weight_category = rc.weight_category
+ AND rc.month = date_trunc('month', p.loading_date)::date;
+```
+
 ### Проверенные результаты
 
-Полный синтетический набор (300 000 исходных сделок, `as_of = 2026-10-26`):
+Метрики текущего прогона (`price_type` 3 и 9, модель `catboost_regressor_v3`) пишутся в лог и в `etl_meta.ml_runs`. Таблица ниже — предыдущая модель v2 на всех фактических типах, до сужения таргета и лага. Её числа не описывают v3.
+
+Полный синтетический набор v2 (300 000 исходных сделок, `as_of = 2026-10-26`):
 
 | Метрика | Было (v1) | Стало (v2) |
 | :--- | ---: | ---: |
@@ -397,12 +412,12 @@ psql -U postgres -d deals_bigdata -v ON_ERROR_STOP=1 -v n_prices=300000 -f sql/s
 1. Опубликуй готовое решение в публичном репозитории на **GitHub** или **GitLab** и отправь ссылку HR-менеджеру.
 2. Убедись, что на чистой машине с установленным Docker проект поднимается без ручных правок командой `docker-compose up`.
 3. Проверь наличие в репозитории обязательных артефактов по чек-листу:
-   * [ ] `README.md` — архитектура решения, обоснование выбранного стека (СУБД, оркестратор, ML-модель), пошаговая инструкция запуска, примеры SQL-запросов для проверки витрин и сводка полученных метрик ML ($R^2$, MAPE, RMSE, MAE);
-   * [ ] `docker-compose.yml`, `Dockerfile`(ы) и `.env.example` — инфраструктура и переменные окружения;
-   * [ ] `etl/` — обязательный код пайплайна валидации, очистки, конвертации валют и идемпотентной загрузки данных с инструкцией повторного запуска за выбранный период (Вопрос 1);
-   * [x] `dags/` — бонус ★: DAG `ul_etl_ml_clickhouse` (профиль Compose `bonus`);
-   * [ ] `sql/` (или `migrations/`) — DDL аналитического слоя (Core / Mart) и эталонный SQL-запрос расчета карточки маршрута и рыночного коридора (Вопрос 2);
-   * [ ] `ml/` — код Feature Pipeline, хронологического обучения модели и пакетного скоринга (Batch Inference) с сохранением прогнозов в БД (Вопрос 3).
+   * [x] `README.md` — архитектура решения, обоснование выбранного стека (СУБД, оркестратор, ML-модель), пошаговая инструкция запуска, примеры SQL-запросов для проверки витрин и сводка полученных метрик ML ($R^2$, MAPE, RMSE, MAE);
+   * [x] `docker-compose.yml`, `Dockerfile`(ы) и `.env.example` — инфраструктура и переменные окружения;
+   * [x] `etl/` — обязательный код пайплайна валидации, очистки, конвертации валют и идемпотентной загрузки данных с инструкцией повторного запуска за выбранный период (Вопрос 1);
+   * [x] `dags/` — бонус ★: ежедневный `ul_etl_daily` и ручной backfill `ul_etl_ml_clickhouse` (профиль Compose `bonus`);
+   * [x] `sql/` (или `migrations/`) — DDL аналитического слоя (Core / Mart) и эталонный SQL-запрос расчета карточки маршрута и рыночного коридора (Вопрос 2);
+   * [x] `ml/` — код Feature Pipeline, хронологического обучения модели и пакетного скоринга (Batch Inference) с сохранением прогнозов в БД (Вопрос 3).
 
 ---
 

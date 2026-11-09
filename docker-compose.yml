@@ -13,7 +13,6 @@ x-airflow-common: &airflow-common
     AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
     UL_PROJECT_ROOT: /opt/airflow/project
     PYTHONPATH: /opt/airflow/project
-    DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-deals_bigdata}
     PGHOST: db
     PGPORT: "5432"
     PGUSER: ${POSTGRES_USER:-postgres}
@@ -23,6 +22,7 @@ x-airflow-common: &airflow-common
     ETL_START_DATE: ${ETL_START_DATE:-2019-01-01}
     ETL_END_DATE: ${ETL_END_DATE:-2027-12-31}
     ML_RANDOM_SEED: ${ML_RANDOM_SEED:-42}
+    ML_TUNE: ${ML_TUNE:-0}
     CLICKHOUSE_HOST: clickhouse
     CLICKHOUSE_PORT: "8123"
     CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
@@ -79,6 +79,7 @@ services:
       ETL_START_DATE: ${ETL_START_DATE:-2019-01-01}
       ETL_END_DATE: ${ETL_END_DATE:-2027-12-31}
       ML_RANDOM_SEED: ${ML_RANDOM_SEED:-42}
+      ML_TUNE: ${ML_TUNE:-0}
       CLICKHOUSE_HOST: ${CLICKHOUSE_HOST:-clickhouse}
       CLICKHOUSE_PORT: ${CLICKHOUSE_PORT:-8123}
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
@@ -220,7 +221,7 @@ services:
       SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD:-admin}
       SUPERSET_ADMIN_EMAIL: ${SUPERSET_ADMIN_EMAIL:-admin@example.com}
       SUPERSET_POSTGRES_URI: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-deals_bigdata}
-      SUPERSET_CLICKHOUSE_URI: clickhousedb://${CLICKHOUSE_USER:-default}:${CLICKHOUSE_PASSWORD:-clickhouse}@clickhouse:8123/${CLICKHOUSE_DB:-default}
+      SUPERSET_CLICKHOUSE_URI: clickhousedb+connect://${CLICKHOUSE_USER:-default}:${CLICKHOUSE_PASSWORD:-clickhouse}@clickhouse:8123/${CLICKHOUSE_DB:-default}
     depends_on:
       superset-db:
         condition: service_healthy

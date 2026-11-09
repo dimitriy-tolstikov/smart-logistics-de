@@ -396,6 +396,62 @@ def test_backfill_handles_route_city_change(conn: psycopg.Connection) -> None:
 
 
 @pytest.mark.integration
+def test_backfill_refreshes_old_route_when_date_moves_into_window(conn: psycopg.Connection) -> None:
+    """Stored date outside the window must still refresh that city pair."""
+    old_load, unload_gc, new_load = 9_993_061, 9_993_062, 9_993_063
+    price_ids: list[int] = []
+    try:
+        with conn.cursor() as cur:
+            _insert_cities(cur, old_load, unload_gc)
+            cur.execute(
+                """
+                INSERT INTO public.cities (
+                    full_name_local, full_name_gc, gc_id, name, longitude, latitude, created_at, updated_at
+                ) VALUES ('Moved Load, Region', 'Moved Load', %s, 'Moved', 41.0, 51.0, now(), now())
+                """,
+                (new_load,),
+            )
+            pid = _insert_price(cur, date(2099, 4, 15), old_load, unload_gc)
+            price_ids = [pid]
+            cur.execute(
+                "INSERT INTO public.price_dates (price_id, price_date) VALUES (%s, %s)",
+                (pid, date(2099, 4, 15)),
+            )
+        conn.commit()
+        run_etl_transaction(conn, date(2099, 4, 1), date(2099, 5, 1), date(2099, 12, 31))
+        conn.commit()
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE public.prices
+                SET loading_city_gcid = %s, loading_date = %s
+                WHERE id = %s
+                """,
+                (new_load, date(2099, 5, 10), pid),
+            )
+            cur.execute(
+                "UPDATE public.price_dates SET price_date = %s WHERE price_id = %s",
+                (date(2099, 5, 10), pid),
+            )
+        conn.commit()
+        run_etl_transaction(conn, date(2099, 5, 1), date(2099, 6, 1), date(2099, 12, 31))
+        conn.commit()
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT loading_city_gcid, loading_date FROM core.fact_prices WHERE price_id = %s", (pid,))
+            city, loaded = cur.fetchone()
+            assert int(city) == new_load
+            assert loaded == date(2099, 5, 10)
+            cur.execute("SELECT COUNT(*) FROM mart.route_card WHERE loading_city_gcid = %s", (old_load,))
+            assert cur.fetchone()[0] == 0
+            cur.execute("SELECT COUNT(*) FROM mart.route_card WHERE loading_city_gcid = %s", (new_load,))
+            assert cur.fetchone()[0] == 1
+    finally:
+        _cleanup(conn, price_ids, [old_load, unload_gc, new_load])
+
+
+@pytest.mark.integration
 def test_weight_volume_boundaries_and_negative_distance(conn: psycopg.Connection) -> None:
     load_gc, unload_gc = 9_993_051, 9_993_052
     price_ids: list[int] = []

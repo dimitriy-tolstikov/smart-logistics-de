@@ -16,6 +16,7 @@ from ml.train_predict import (
     _mask_test,
     _mask_train,
     _mask_val,
+    _optional_float,
     _parse_region,
     build_model,
     cyclic_date_features,
@@ -110,6 +111,16 @@ def test_feature_columns_exclude_forbidden_target_fields() -> None:
         "max_km_price",
     ):
         assert name not in src
+    assert "price_type IN (3, 9)" in src
+    assert "lag_median_trip" in src
+    assert "string_agg" not in src
+    assert "MIN(body_group_std_id)" in src
+
+
+def test_missing_coordinates_stay_missing() -> None:
+    assert math.isnan(_optional_float(None))
+    assert _optional_float(0) == 0.0
+    assert _optional_float(55.7) == 55.7
 
 
 def test_future_scoring_null_rule() -> None:

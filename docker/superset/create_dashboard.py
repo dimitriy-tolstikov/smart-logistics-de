@@ -5,9 +5,11 @@ Runs inside the Superset container after `superset init`.
 
 from __future__ import annotations
 
+import json
 import os
 import textwrap
 
+from sqlalchemy.dialects import registry
 from superset.app import create_app
 
 
@@ -15,7 +17,29 @@ def _env(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
+def _native_filter(filter_id: str, name: str, column: str, dataset_id: int) -> dict:
+    return {
+        "id": filter_id,
+        "name": name,
+        "filterType": "filter_select",
+        "targets": [{"datasetId": dataset_id, "column": {"name": column}}],
+        "defaultDataMask": {"extraFormData": {}, "filterState": {}, "ownState": {}},
+        "cascadeParentIds": [],
+        "scope": {"rootPath": ["ROOT_ID"], "excluded": []},
+        "controlValues": {
+            "enableEmptyFilter": False,
+            "defaultToFirstItem": False,
+            "multiSelect": True,
+            "searchAllOptions": False,
+            "inverseSelection": False,
+        },
+        "type": "NATIVE_FILTER",
+        "description": "",
+    }
+
+
 def main() -> None:
+    registry.load("clickhousedb.connect")
     app = create_app()
     with app.app_context():
         from flask_appbuilder.security.sqla.models import User
@@ -39,7 +63,7 @@ def main() -> None:
         )
         ch_uri = _env(
             "SUPERSET_CLICKHOUSE_URI",
-            "clickhousedb://default:clickhouse@clickhouse:8123/default",
+            "clickhousedb+connect://default:clickhouse@clickhouse:8123/default",
         )
 
         def upsert_database(name: str, uri: str, extra: str = "{}") -> Database:
@@ -116,11 +140,11 @@ def main() -> None:
                 existing_ch.fetch_metadata()
                 db.session.commit()
             except Exception as meta_exc:  # noqa: BLE001
-                print(f"  warn: ClickHouse fetch_metadata: {meta_exc}")
                 db.session.rollback()
+                raise RuntimeError(f"ClickHouse dataset metadata failed: {meta_exc}") from meta_exc
         except Exception as exc:  # noqa: BLE001
-            print(f"  warn: ClickHouse dataset: {exc}")
             db.session.rollback()
+            raise RuntimeError(f"ClickHouse dataset was not created: {exc}") from exc
 
         def upsert_chart(
             *,
@@ -192,7 +216,8 @@ def main() -> None:
                   "adhoc_filters": [],
                   "all_columns": [
                     "loading_date", "loading_city_gcid", "unloading_city_gcid",
-                    "body_group", "actual_price_rub", "predicted_price_rub",
+                    "body_group_std_id", "weight_category",
+                    "actual_price_rub", "predicted_price_rub",
                     "ape_pct", "model_name"
                   ],
                   "row_limit": 100,
@@ -210,6 +235,37 @@ def main() -> None:
             db.session.add(dash)
         dash.slug = "smart-logistics-corridor"
         dash.slices = [corridor, reliability, fact_vs_pred]
+        dash.json_metadata = json.dumps(
+            {
+                "native_filter_configuration": [
+                    _native_filter("NATIVE_FILTER-month", "Месяц", "month", route_pg.id),
+                    _native_filter(
+                        "NATIVE_FILTER-load",
+                        "Город отправления",
+                        "loading_city_gcid",
+                        route_pg.id,
+                    ),
+                    _native_filter(
+                        "NATIVE_FILTER-unload",
+                        "Город назначения",
+                        "unloading_city_gcid",
+                        route_pg.id,
+                    ),
+                    _native_filter(
+                        "NATIVE_FILTER-body",
+                        "Группа кузова",
+                        "body_group_std_id",
+                        route_pg.id,
+                    ),
+                    _native_filter(
+                        "NATIVE_FILTER-weight",
+                        "Весовая категория",
+                        "weight_category",
+                        route_pg.id,
+                    ),
+                ]
+            }
+        )
         # Simple vertical layout positions (Superset 4 position JSON).
         dash.position_json = textwrap.dedent(
             f"""\

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from datetime import date
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlparse
 
 from dotenv import load_dotenv
 
@@ -23,16 +23,38 @@ N_PRICES: int = int(os.getenv("N_PRICES", "300000"))
 ML_RANDOM_SEED: int = int(os.getenv("ML_RANDOM_SEED", "42"))
 
 
+def _quoted_database_url(user: str, password: str, host: str, port: int | str, db: str) -> str:
+    """Percent-encode user and password so @ and : inside them do not break the DSN."""
+    return (
+        f"postgresql://{quote(user, safe='')}:"
+        f"{quote(password, safe='')}@{host}:{port}/{quote(db, safe='')}"
+    )
+
+
 def database_url() -> str:
     url = os.getenv("DATABASE_URL")
     if url:
+        parsed = urlparse(url)
+        if parsed.hostname and parsed.username is not None:
+            return _quoted_database_url(
+                unquote(parsed.username),
+                unquote(parsed.password or ""),
+                parsed.hostname,
+                parsed.port or 5432,
+                unquote((parsed.path or "/").lstrip("/")),
+            )
         return url
     host = os.getenv("PGHOST", "localhost")
     user = os.getenv("PGUSER", os.getenv("POSTGRES_USER", "postgres"))
     password = os.getenv("PGPASSWORD", os.getenv("POSTGRES_PASSWORD", "postgres"))
     db = os.getenv("PGDATABASE", os.getenv("POSTGRES_DB", "deals_bigdata"))
     port = os.getenv("PGPORT", os.getenv("POSTGRES_PORT", "5432"))
-    return f"postgresql://{user}:{password}@{host}:{port}/{db}"
+    return _quoted_database_url(user, password, host, port, db)
+
+
+def ml_tune_enabled() -> bool:
+    """Hyper-parameter search is off unless ML_TUNE=1. Default fit uses the chosen params."""
+    return os.getenv("ML_TUNE", "0").lower() in {"1", "true", "yes"}
 
 
 def pg_conn_kwargs() -> dict:
@@ -43,9 +65,9 @@ def pg_conn_kwargs() -> dict:
         return {
             "host": p.hostname or "localhost",
             "port": p.port or 5432,
-            "user": p.username,
-            "password": p.password,
-            "dbname": (p.path or "/").lstrip("/"),
+            "user": unquote(p.username) if p.username else p.username,
+            "password": unquote(p.password) if p.password else p.password,
+            "dbname": unquote((p.path or "/").lstrip("/")),
         }
     return {
         "host": os.getenv("PGHOST", "localhost"),

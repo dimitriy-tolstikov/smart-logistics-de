@@ -7,7 +7,7 @@ import pytest
 
 from etl.config import AS_OF
 from etl.run_etl import run_etl_transaction
-from ml.train_predict import load_training_table, write_predictions
+from ml.train_predict import CAT_COLS, NUM_COLS, load_training_table, write_predictions
 from tests.db_helpers import integration_dsn
 
 
@@ -312,6 +312,32 @@ def test_dq_fx_and_category_rounding(conn: psycopg.Connection) -> None:
 
 
 @pytest.mark.integration
+def test_lag_median_uses_previous_calendar_month(conn: psycopg.Connection) -> None:
+    load_gc, unload_gc = 9_992_081, 9_992_082
+    may_day, june_day = date(2026, 5, 10), date(2026, 6, 10)
+    price_ids: list[int] = []
+    try:
+        with conn.cursor() as cur:
+            _insert_cities(cur, load_gc, unload_gc)
+            may_id = _insert_price(cur, may_day, load_gc, unload_gc, price=40_000.0)
+            june_id = _insert_price(cur, june_day, load_gc, unload_gc, price=80_000.0)
+            price_ids = [may_id, june_id]
+        conn.commit()
+        run_etl_transaction(conn, date(2026, 5, 1), date(2026, 7, 1), AS_OF)
+        conn.commit()
+
+        tbl = load_training_table(conn)
+        positions = {int(price_id): i for i, price_id in enumerate(tbl.price_id)}
+        lag_i = len(CAT_COLS) + list(NUM_COLS).index("lag_median_trip")
+        may_lag = float(tbl.feature_matrix[positions[may_id], lag_i])
+        june_lag = float(tbl.feature_matrix[positions[june_id], lag_i])
+        assert may_lag != may_lag  # NaN: April cell does not exist
+        assert june_lag == pytest.approx(40_000.0)
+    finally:
+        _cleanup_prices(conn, price_ids, [load_gc, unload_gc], load_gc)
+
+
+@pytest.mark.integration
 def test_future_scoring_set_includes_type6_complex_and_outliers(conn: psycopg.Connection) -> None:
     load_gc, unload_gc = 9_992_031, 9_992_032
     future_date = AS_OF + timedelta(days=10)
@@ -345,7 +371,8 @@ def test_future_scoring_set_includes_type6_complex_and_outliers(conn: psycopg.Co
         tbl = load_training_table(conn)
         positions = {int(price_id): i for i, price_id in enumerate(tbl.price_id)}
         assert set(price_ids).issubset(positions)
-        assert tbl.body_group[positions[type6_id]] == "15|56"
+        assert tbl.body_group[positions[type6_id]] == "15"
+        assert int(tbl.body_group_std_id[positions[type6_id]]) == 15
     finally:
         _cleanup_prices(conn, price_ids, [load_gc, unload_gc], load_gc)
 
@@ -364,6 +391,8 @@ def test_ml_write_rolls_back_truncate_on_insert_failure(conn: psycopg.Connection
             0,
             0,
             "test",
+            None,
+            None,
             None,
             predicted,
             None,

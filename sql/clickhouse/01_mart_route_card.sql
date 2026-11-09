@@ -39,6 +39,8 @@ CREATE TABLE IF NOT EXISTS mart.ml_price_predictions
     loading_city_gcid   Int32,
     unloading_city_gcid Int32,
     body_group          String,
+    weight_category     Nullable(String),
+    body_group_std_id   Nullable(Int32),
     actual_price_rub    Nullable(Float64),
     predicted_price_rub Float64,
     abs_error_rub       Nullable(Float64),
@@ -49,3 +51,9 @@ CREATE TABLE IF NOT EXISTS mart.ml_price_predictions
 ENGINE = ReplacingMergeTree(scored_at)
 ORDER BY price_id
 SETTINGS index_granularity = 8192;
+
+ALTER TABLE mart.ml_price_predictions
+    ADD COLUMN IF NOT EXISTS weight_category Nullable(String);
+
+ALTER TABLE mart.ml_price_predictions
+    ADD COLUMN IF NOT EXISTS body_group_std_id Nullable(Int32);
